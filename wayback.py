@@ -22,7 +22,7 @@ from urllib.parse import urljoin
 from tqdm import tqdm
 
 # ---------------- CONFIG ----------------
-INPUT_CSV = "../taaft_tools_2015_2025.csv"
+INPUT_CSV = "taaft_tools_2015_2025.csv"
 URL_COLUMN = "tool_url"
 OUT_CSV = "ai_wayback_async_out2.csv"
 PROXIES_FILE = "proxies.txt"     # optional, one proxy per line: http://ip:port or socks5://ip:port
@@ -1181,45 +1181,116 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
         record["top_alternative_count"] = len(li_items)
         record["top_alternative_json"] = json.dumps(li_items, ensure_ascii=False) if li_items else json.dumps([], ensure_ascii=False)
 
+       # -------------------------
+        # featured / list li cards (tf_xyz3 etc.)
         # -------------------------
-        # alternatives (list of alternative tools)
-        # -------------------------
-        alts = []
-        for alt in soup.find_all("a", class_="alternative_link"):
+        featured_items = []
+
+        for li in soup.find_all("li", attrs={"data-id": True}):
             try:
-                # link
-                href = alt.get("href")
-                link = urljoin(BASE_URL, href) if href else None
+                # basic attributes from <li>
+                item_id = li.get("data-id")
+                name_attr = li.get("data-name")
+                task_attr = li.get("data-task")
+                task_id = li.get("data-task_id")
+                task_slug = li.get("data-task_slug")
+                featured = li.get("data-featured") == "true"
+                release_attr = li.get("data-release")
 
-                # name (inside <span>)
-                name_tag = alt.find("span")
-                name = name_tag.get_text(" ", strip=True) if name_tag else None
+                # AI page link + name + version
+                ai_link = li.find("a", class_="ai_link")
+                ai_name = None
+                ai_page = None
+                version = None
+                if ai_link:
+                    ai_page = ai_link.get("href")
+                    ai_page = urljoin(BASE_URL, ai_page) if ai_page else None
 
-                # views (inside .stats_opens)
+                    name_span = ai_link.find("span")
+                    ai_name = name_span.get_text(" ", strip=True) if name_span else None
+
+                    version_span = ai_link.find("span", class_="current_version")
+                    version = version_span.get_text(" ", strip=True) if version_span else None
+
+                # external website
+                ext = li.find("a", class_="external_ai_link")
+                external_url = ext.get("href") if ext and ext.get("href") else None
+
+                # short description
+                desc_tag = li.find("div", class_="short_desc")
+                short_desc = desc_tag.get_text(" ", strip=True) if desc_tag else None
+
+                # task label (name + link)
+                task_label_tag = li.find("a", class_="task_label")
+                task_label_name = task_label_tag.get_text(" ", strip=True) if task_label_tag else None
+                task_label_url = (
+                    urljoin(BASE_URL, task_label_tag.get("href"))
+                    if task_label_tag and task_label_tag.get("href")
+                    else None
+                )
+
+                # released relative date
+                released_relative = None
+                released_tag = li.find("div", class_="released")
+                if released_tag:
+                    rel = released_tag.find("span", class_="relative")
+                    released_relative = rel.get_text(" ", strip=True) if rel else None
+
+                # pricing
+                price_tag = li.find("a", class_="ai_launch_date")
+                pricing = price_tag.get_text(" ", strip=True) if price_tag else None
+
+                # stats (views, saves, rating)
                 views = None
-                views_div = alt.find("div", class_="stats_opens")
-                if views_div:
-                    # direct text after SVG
-                    vtxt = views_div.get_text(" ", strip=True)
-                    # extract digits (handles commas)
-                    m = re.search(r"(\d[\d,]*)", vtxt)
-                    if m:
-                        views = to_int_or_none(m.group(1).replace(",", ""))
-                    else:
-                        views = to_int_or_none(vtxt)
+                saves = None
+                rating = None
 
-                alts.append({
-                    "name": name,
-                    "link": link,
-                    "views": views
+                stats = li.find("a", class_="stats")
+                if stats:
+                    views_tag = stats.select_one(".stats_views span")
+                    if views_tag:
+                        views = to_int_or_none(views_tag.get_text(strip=True).replace(",", ""))
+
+                    saves_tag = stats.select_one(".saves")
+                    if saves_tag:
+                        saves = to_int_or_none(saves_tag.get_text(strip=True))
+
+                    rating_tag = stats.select_one(".average_rating")
+                    if rating_tag:
+                        m = re.search(r"(\d+(?:\.\d+)?)", rating_tag.get_text(" ", strip=True))
+                        rating = float(m.group(1)) if m else None
+
+                featured_items.append({
+                    "id": item_id,
+                    "name": ai_name or name_attr,
+                    "version": version,
+                    "ai_page": ai_page,
+                    "external_url": external_url,
+                    "short_desc": short_desc,
+                    "task": task_attr,
+                    "task_id": task_id,
+                    "task_slug": task_slug,
+                    "task_label_name": task_label_name,
+                    "task_label_url": task_label_url,
+                    "featured": featured,
+                    "release_info": release_attr,
+                    "released_relative": released_relative,
+                    "pricing": pricing,
+                    "views": views,
+                    "saves": saves,
+                    "rating": rating
                 })
+
             except Exception as e:
-                print(f"[alternatives parse] skipped one due to: {e}")
+                print(f"[featured li parse] skipped one due to: {e}")
                 continue
 
-        record["feature_alternatives_count"] = len(alts)
-        record["feature_alternatives_json"] = json.dumps(alts, ensure_ascii=False) if alts else json.dumps([], ensure_ascii=False)
-
+        record["featured_items_count"] = len(featured_items)
+        record["featured_items_json"] = (
+            json.dumps(featured_items, ensure_ascii=False)
+            if featured_items
+            else json.dumps([], ensure_ascii=False)
+        )
 
     except Exception as e:
         print(f"[get_cols] unexpected error on {link}: {e}")
