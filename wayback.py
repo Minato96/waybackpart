@@ -119,8 +119,8 @@ COLUMNS = [
     "faq_json",
     "top_alternative_count",
     "top_alternative_json",
-    "feature_alternatives_count",
-    "feature_alternatives_json",
+    "featured_items_count",
+    "feature_items_json",
     "error"
 ]
 
