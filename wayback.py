@@ -120,7 +120,7 @@ COLUMNS = [
     "top_alternative_count",
     "top_alternative_json",
     "featured_items_count",
-    "feature_items_json",
+    "featured_items_json",
     "error"
 ]
 
