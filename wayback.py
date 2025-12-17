@@ -31,8 +31,8 @@ TOR_PROXY = "socks5://127.0.0.1:9050"
 
 # Wayback/CDX
 WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
-WAYBACK_FROM = "2025"
-WAYBACK_TO = "2025"
+WAYBACK_FROM = "2024"
+WAYBACK_TO = "2024"
 WAYBACK_FILTER = "statuscode:200"
 BASE_URL = "https://theresanaiforthat.com/"
 
