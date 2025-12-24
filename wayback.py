@@ -24,15 +24,15 @@ from tqdm import tqdm
 # ---------------- CONFIG ----------------
 INPUT_CSV = "taaft_tools_2015_2025.csv"
 URL_COLUMN = "tool_url"
-OUT_CSV = "ai_wayback_async_out2.csv"
+OUT_CSV = "ai_wayback_async_out_2023.csv" #
 PROXIES_FILE = "proxies.txt"     # optional, one proxy per line: http://ip:port or socks5://ip:port
 USE_TOR = False                  # if True, your local tor must be running (socks5://127.0.0.1:9050)
 TOR_PROXY = "socks5://127.0.0.1:9050"
 
 # Wayback/CDX
 WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
-WAYBACK_FROM = "2024"
-WAYBACK_TO = "2024"
+WAYBACK_FROM = "2023"
+WAYBACK_TO = "2023"
 WAYBACK_FILTER = "statuscode:200"
 BASE_URL = "https://theresanaiforthat.com/"
 
@@ -53,40 +53,27 @@ CHECKPOINT_FILE = "wayback_checkpoint.json"  # stores processed keys set (saves 
 # Columns (keeps your parsing outputs + wayback fields)
 
 COLUMNS = [
-    "name",
+    "use_case_name",
+    "use_case_category",
+    "use_case_created_date",
     "link",
     "tool_link",
     "description",
-    "use_case",
-    "pricing_model",
-    "saves",
-    "rating",
-    "number_of_ratings",
-    "number_of_comments",
-    "versions_count",
-    "versions",
-    "pros_count",
-    "cons_count",
-    "pros",        # joined string for human-readable CSV
-    "cons",        # joined string for human-readable CSV
-    "pros_json",   # OPTIONAL: JSON array (analytics-friendly)
-    "cons_json",    # OPTIONAL: JSON array (analytics-friendly)
-    "also_searched",
-    "also_searched_json",
+    "rank_task_name",
+    "rank_full_text",
+    "rank_number",
+    "rank_label",
+    "tags",              # human-readable joined string
+    "tags_json",         # JSON array of tags
+    "tags_count",        # number of tags
+    "tag_price",          # pricing text (Free, Free + from $20/mo, etc.)
+    "description",        # human-readable joined text
+    "description_json",   # list of paragraphs (analytics / NLP)
+    "description_length",  # optional but VERY useful
+    "listings_count",
+    "listings_json",
     "also_searched_count",
-    "rank_text",
-    "comments_count",
-    "comments_json",
-    "task_label_name",
-    "task_label_url",
-    "faq_count",
-    "faq_json",
-    "featured_cards_count",
-    "featured_cards_json",
-    "tools_count",
-    "tools_json",
-    "cards_count",
-    "cards_json",
+    "also_searched_json",
     "error"
 ]
 
@@ -271,514 +258,229 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
     record["snapshot_url"] = snapshot_url
     record["link"] = snapshot_url
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        h1 = soup.find("h1")
+        if h1:
+            # -------- use case name (Chatting) --------
+            use_case_a = h1.select_one(".rank_task_name a.use_case_top")
+            record["use_case_name"] = use_case_a.get_text(" ", strip=True) if use_case_a else None
 
-        # name
-        h1 = soup.find("h1", class_="title_inner")
-        record["name"] = safe_find_text(h1, None, recursive=False)
+            # -------- created date (30 Nov 2022) --------
+            date_span = h1.select_one(".rank_task_name .launch_date_top")
+            date_raw = date_span.get_text(" ", strip=True) if date_span else None
 
-        # -------------------------
-        # tool link ("Use tool")
-        # -------------------------
-        tool_a = soup.find("a", id="ai_top_link")
-        if tool_a and tool_a.get("href"):
-            href = tool_a.get("href")
-            # normalize into absolute unless it's already external
-            record["tool_link"] = urljoin(BASE_URL, href) if href.startswith("/") else href
+            # normalize date if possible
+            if date_raw:
+                try:
+                    dt = pd.to_datetime(date_raw, errors="coerce")
+                    record["use_case_created_date"] = (
+                        dt.strftime("%Y-%m-%d") if not pd.isna(dt) else date_raw
+                    )
+                except Exception:
+                    record["use_case_created_date"] = date_raw
+            else:
+                record["use_case_created_date"] = None
+
+            # -------- category (ChatGPT) --------
+            # second direct div under h1
+            category_divs = h1.find_all("div", recursive=False)
+            record["use_case_category"] = (
+                category_divs[1].get_text(" ", strip=True)
+                if len(category_divs) > 1
+                else None
+            )
         else:
-            record["tool_link"] = None
+            record["use_case_name"] = None
+            record["use_case_category"] = None
+            record["use_case_created_date"] = None
 
+        rank_a = soup.find("a", class_="rank_inner")
+        if rank_a:
+            # task name
+            task_span = rank_a.find("span", class_="rank_task_name")
+            record["rank_task_name"] = task_span.get_text(" ", strip=True) if task_span else None
 
-        desc_block = soup.find("div", class_="description")
-        if not desc_block:
-            # fallback: sometimes class order may differ, so catch using selector
-            desc_block = soup.select_one("div.description")
+            # bottom rank text
+            bottom_span = rank_a.find("span", class_="bottom")
+            bottom_text = bottom_span.get_text(" ", strip=True) if bottom_span else None
 
-        if desc_block:
-            # get the raw HTML text with <br> converted to newline
-            desc_html = desc_block.decode_contents()
+            record["rank_full_text"] = bottom_text  # "#40 most recent"
 
-            # Replace <br> tags manually with newline
-            desc_html = desc_html.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+            # extract number + label separately
+            if bottom_text:
+                # remove #
+                clean = bottom_text.replace("#", "").strip()
+                parts = clean.split(" ", 1)
 
-            # Now strip HTML tags using BeautifulSoup again (quick clean-up)
-            temp_soup = BeautifulSoup(desc_html, "html.parser")
-            cleaned_desc = temp_soup.get_text("\n", strip=True)
+                record["rank_number"] = to_int_or_none(parts[0]) if parts else None
+                record["rank_label"] = parts[1] if len(parts) > 1 else None
+            else:
+                record["rank_number"] = None
+                record["rank_label"] = None
+        else:
+            record["rank_task_name"] = None
+            record["rank_full_text"] = None
+            record["rank_number"] = None
+            record["rank_label"] = None
 
-            record["description"] = cleaned_desc if cleaned_desc else None
+        #--------------
+        # tags
+        #--------------
+        tags_div = soup.find("div", class_="tags")
+
+        if tags_div:
+            tags_list = []
+            price_text = None
+
+            for span in tags_div.find_all("span", class_="tag"):
+                # price tag (special case)
+                if "price" in span.get("class", []):
+                    price_text = span.get_text(" ", strip=True)
+                else:
+                    txt = span.get_text(" ", strip=True)
+                    if txt:
+                        tags_list.append(txt)
+
+            record["tags_count"] = len(tags_list)
+            record["tags"] = " || ".join(tags_list) if tags_list else None
+            record["tags_json"] = json.dumps(tags_list, ensure_ascii=False) if tags_list else None
+            record["tag_price"] = price_text
+        else:
+            record["tags_count"] = None
+            record["tags"] = None
+            record["tags_json"] = None
+            record["tag_price"] = None
+
+        #------------
+        #description
+        #------------
+        desc_div = soup.find("div", class_="description")
+
+        if desc_div:
+            # remove method block if present
+            method_div = desc_div.find("div", class_="method")
+            if method_div:
+                method_div.decompose()
+
+            # extract paragraph texts
+            paragraphs = [
+                p.get_text(" ", strip=True)
+                for p in desc_div.find_all("p")
+                if p.get_text(strip=True)
+            ]
+
+            # final assignments
+            record["description"] = "\n\n".join(paragraphs) if paragraphs else None
+            record["description_json"] = json.dumps(paragraphs, ensure_ascii=False) if paragraphs else None
+            record["description_length"] = len(record["description"]) if record["description"] else 0
         else:
             record["description"] = None
+            record["description_json"] = None
+            record["description_length"] = None
 
 
-        # -------------------------
-        # use_case extraction
-        # -------------------------
-        use_case_div = soup.find("div", id="use_case")
-        if use_case_div:
-            record["use_case"] = use_case_div.get_text(" ", strip=True)
-        else:
-            record["use_case"] = None
+        items = []
 
-        # pricing
-        pricing_divs = soup.find_all("span", class_="tag_price")
-        pricing_texts = []
-        for div in pricing_divs:
-            t = div.find(string=True, recursive=False)
-            if not t:
-                t = div.get_text(" ", strip=True)
-            pricing_texts.append(t.strip() if t else None)
-        mapping_keys = ["pricing_model"]
-        for i, k in enumerate(mapping_keys):
-            if i < len(pricing_texts):
-                record[k] = pricing_texts[i]
+        for li in soup.select("li.li"):
+            item = {}
 
-        # saves
-        saves_div = soup.find("div", class_="saves")
-        record["saves"] = safe_find_text(saves_div, None, recursive=False)
-
-        # rating (4.7)
-        rating_anchor = soup.find("a", class_="rating_top")
-        if rating_anchor:
-            # first span is star, second has rating + nested ratings_count
-            second_span = rating_anchor.select_one("span:nth-of-type(2)")
-            record["rating"] = safe_find_text(second_span, None, recursive=False)
-
-        # number_of_ratings (the (11) -> 11)
-        ratings_count_span = soup.find("span", class_="ratings_count")
-        rc_text = safe_find_text(ratings_count_span, None, recursive=False)
-        # strip parentheses and coerce to int if possible
-        record["number_of_ratings"] = to_int_or_none(rc_text.strip("() ")) if rc_text else None
-
-        # number_of_comments
-        comments_anchor = soup.find("a", class_="comments")
-        comments_text = safe_find_text(comments_anchor, None, recursive=False)
-        record["number_of_comments"] = to_int_or_none(comments_text)
-
-        # -------------------------
-        # versions extraction (list of {version, date, changelog})
-        # -------------------------
-        versions_list = []
-        # select all release blocks (both current and hidden ones)
-        for vdiv in soup.select("div.version"):
-            try:
-                # header and children
-                header = vdiv.find("div", class_="version_header")
-                ver_num_div = header.find("div", class_="version_number") if header else None
-                changelog_title_div = header.find("div", class_="changelog_title") if header else None
-
-                # version text (e.g., "Intuo ... v4.2") -> extract "v4.2"
-                ver_text = None
-                if ver_num_div:
-                    ver_text = ver_num_div.get_text(" ", strip=True)
-                # fallback to id attribute if text missing
-                if not ver_text:
-                    vid = vdiv.get("id")  # e.g., "release-v4.2"
-                    if vid:
-                        # try to take last dash part
-                        ver_text = vid.split("-")[-1]
-                # regex find version token like v1 or v1.2.3
-                ver_token = None
-                if ver_text:
-                    m = re.search(r"\bv\d+(?:\.\d+)*\b", ver_text)
-                    if m:
-                        ver_token = m.group(0)
-                    else:
-                        # if nothing, fallback to last word (may still be useful)
-                        ver_token = ver_text.split()[-1]
-
-                # date string (as shown in the changelog_title div)
-                date_text = None
-                if changelog_title_div:
-                    date_text = changelog_title_div.get_text(" ", strip=True)
-                # try to canonicalize to ISO date (YYYY-MM-DD) using pandas (falls back to raw text)
-                date_iso = None
-                if date_text:
-                    try:
-                        dt = pd.to_datetime(date_text, errors="coerce")
-                        if not pd.isna(dt):
-                            date_iso = dt.strftime("%Y-%m-%d")
-                        else:
-                            date_iso = date_text  # keep original if parsing failed
-                    except Exception:
-                        date_iso = date_text
-
-                # changelog text (the free text in version_changelog)
-                changelog_div = vdiv.find("div", class_="version_changelog")
-                changelog_text = changelog_div.get_text(" ", strip=True) if changelog_div else None
-
-                # only append if we have some info (avoid empty junk)
-                if ver_token or date_iso or changelog_text:
-                    versions_list.append({
-                        "version": ver_token,
-                        "date": date_iso,
-                        "changelog": changelog_text
-                    })
-            except Exception as e:
-                # don't let one funky release kill everything
-                print(f"[versions parsing] skipped a block due to: {e}")
-                continue
-
-        # final assignment to the record
-        record["versions_count"] = len(versions_list)
-        # store JSON string (safe for CSV); analytics team can parse this JSON later
-        record["versions"] = json.dumps(versions_list, ensure_ascii=False)
-
-
-        pros_cons_section = soup.find("section", id="pros-and-cons")
-        if pros_cons_section:
-
-            pros_items = []
-            cons_items = []
-
-            pros_block = pros_cons_section.find("div", class_="pac-info-item-pros")
-            if pros_block:
-                for d in pros_block.find_all("div", recursive=False):
-                    text = d.get_text(" ", strip=True)
-                    if text:
-                        pros_items.append(text)
-
-            cons_block = pros_cons_section.find("div", class_="pac-info-item-cons")
-            if cons_block:
-                for d in cons_block.find_all("div", recursive=False):
-                    text = d.get_text(" ", strip=True)
-                    if text:
-                        cons_items.append(text)
-
-            record["pros_count"] = len(pros_items)
-            record["cons_count"] = len(cons_items)
-
-            record["pros"] = " || ".join(pros_items) if pros_items else None
-            record["cons"] = " || ".join(cons_items) if cons_items else None
-
-            record["pros_json"] = json.dumps(pros_items, ensure_ascii=False) if pros_items else None
-            record["cons_json"] = json.dumps(cons_items, ensure_ascii=False) if cons_items else None
-
-        else:
-            record["pros_count"] = None
-            record["cons_count"] = None
-            record["pros"] = None
-            record["cons"] = None
-            record["pros_json"] = None
-            record["cons_json"] = None
-
-            
-        also_div = soup.find("div", class_="also_searched_inner")
-        if also_div:
-            # extract all <a> tags inside the container
-            als = [a.get_text(" ", strip=True) for a in also_div.find_all("a")]
-
-            record["also_searched"] = " || ".join(als) if als else None
-            record["also_searched_json"] = json.dumps(als, ensure_ascii=False) if als else None
-            record["also_searched_count"] = len(als) if als else 0
-        else:
-            record["also_searched"] = None
-            record["also_searched_json"] = None
-            record["also_searched_count"] = None
-        
-        # -------------------------
-        # leaderboard rank & score
-        # -------------------------
-        rank_bottom = soup.find("span", class_="bottom")
-        if rank_bottom:
-            # remove the # symbol text
-            rank_symbol = rank_bottom.find("span", class_="rank_symbol")
-            if rank_symbol:
-                rank_symbol.extract()
-
-            rank_text = rank_bottom.get_text(" ", strip=True)
-            record["rank_text"] = rank_text if rank_text else None
-        else:
-            record["rank_text"] = None
-
-        # -------------------------
-        # comments (all, nested) -> comments_json (list of nested dicts) + comments_count
-        # -------------------------
-        wrappers = soup.find_all("div", class_="comment-wrapper")
-        comments_map = {}   # id -> dict (with children list)
-        parent_of = {}      # id -> parent_id
-
-        for w in wrappers:
-            c = w.find("div", class_="comment")
-            if not c:
-                continue
-            cid = c.get("data-id")
-            if not cid:
-                # skip if no id (rare)
-                continue
-
-            # user id (data-user on comment), username, profile url
-            user_id = c.get("data-user")
-            user_name_tag = c.find("div", class_="user_name")
-            user_name = user_name_tag.get_text(strip=True) if user_name_tag else None
-            profile_a = c.find("a", class_="user_card")
-            user_profile = urljoin(BASE_URL, profile_a.get("href")) if profile_a and profile_a.get("href") else None
-
-            # date (text inside .comment_date > a). Normalize to yyyy-mm-dd if possible
-            date_tag = c.find("div", class_="comment_date")
-            date_text = None
-            date_iso = None
-            if date_tag:
-                at = date_tag.find("a")
-                if at:
-                    date_text = at.get_text(" ", strip=True)
-                    try:
-                        dt = pd.to_datetime(date_text, errors="coerce")
-                        if not pd.isna(dt):
-                            date_iso = dt.strftime("%Y-%m-%d")
-                        else:
-                            date_iso = date_text
-                    except Exception:
-                        date_iso = date_text
-
-            # rating: count .star-full inside comment_rating
-            rating_wrap = c.find("div", class_="comment_rating")
-            rating_val = None
-            if rating_wrap:
-                rating_val = len(rating_wrap.select(".star-full"))
-
-            # body text
-            body_tag = c.find("div", class_="comment_body")
-            body_text = body_tag.get_text(" ", strip=True) if body_tag else None
-
-            # upvotes/downvotes (extract ints)
-            up_tag = c.find("span", class_="comment_upvote")
-            up_val = None
-            if up_tag:
-                ut = up_tag.get_text(" ", strip=True)
-                m2 = re.search(r"(\d+)", ut)
-                if m2:
-                    try:
-                        up_val = int(m2.group(1))
-                    except Exception:
-                        up_val = None
-
-            # Build initial comment dict (children empty list)
-            comments_map[cid] = {
-                "id": cid,
-                "user_id": user_id,
-                "user_name": user_name,
-                "user_profile": user_profile,
-                "date": date_iso,
-                "date_raw": date_text,
-                "rating": rating_val,
-                "body": body_text,
-                "upvotes": up_val,
-                "children": []
-            }
-
-            # determine parent comment-wrapper (immediate parent wrapper)
-            parent_wrapper = w.find_parent("div", class_="comment-wrapper")
-            if parent_wrapper:
-                # parent_wrapper may contain its own comment; find parent's comment div
-                parent_comment = parent_wrapper.find("div", class_="comment")
-                if parent_comment and parent_comment.get("data-id"):
-                    parent_of[cid] = parent_comment.get("data-id")
-                else:
-                    parent_of[cid] = None
+            # ---------- NAME + INTERNAL LINK ----------
+            ai_link = li.select_one("a.ai_link")
+            if ai_link:
+                item["name"] = ai_link.get_text(" ", strip=True)
+                item["internal_link"] = urljoin(BASE_URL, ai_link.get("href"))
             else:
-                parent_of[cid] = None
+                item["name"] = None
+                item["internal_link"] = None
 
-        # now link children to parents (linear assembly)
-        for cid, pdata in list(parent_of.items()):
-            pid = pdata
-            if pid and pid in comments_map:
-                comments_map[pid]["children"].append(comments_map[cid])
+            # ---------- EXTERNAL LINK ----------
+            ext = li.select_one("a.external_ai_link")
+            item["external_link"] = ext.get("href") if ext else None
 
-        # collect roots (top-level comments)
-        roots = []
-        for cid, comment_obj in comments_map.items():
-            if not parent_of.get(cid):
-                roots.append(comment_obj)
+            # ---------- DOMAIN (format 1 only, optional) ----------
+            domain = li.select_one(".domain")
+            item["domain"] = domain.get_text(strip=True).strip("()") if domain else None
 
-        # final assignment
-        record["comments_count"] = len(comments_map)
-        # store JSON string (nested comments). analytics can parse this.
-        record["comments_json"] = json.dumps(roots, ensure_ascii=False) if roots else json.dumps([], ensure_ascii=False)
+            # ---------- USE CASE ----------
+            use_case = li.select_one(".use_case")
+            item["use_case"] = use_case.get_text(" ", strip=True) if use_case else None
 
-        # -------------------------
-        # single task_label extraction (name + link)
-        # -------------------------
-        
-        tlabel = soup.find("a", class_="task_label")
-        if tlabel:
-            # name
-            record["task_label_name"] = tlabel.get_text(" ", strip=True)
+            # ---------- TASK ----------
+            task = li.select_one("a.task_label")
+            if task:
+                item["task_name"] = task.get_text(" ", strip=True)
+                item["task_link"] = urljoin(BASE_URL, task.get("href"))
+            else:
+                item["task_name"] = None
+                item["task_link"] = None
 
-            # absolute link
-            href = tlabel.get("href")
-            record["task_label_url"] = urljoin(BASE_URL, href) if href else None
-        else:
-            record["task_label_name"] = None
-            record["task_label_url"] = None
-    
+            # ---------- TAGS + PRICE ----------
+            tags = []
+            price = None
+            for t in li.select(".tags .tag"):
+                if "price" in t.get("class", []):
+                    price = t.get_text(strip=True)
+                else:
+                    tags.append(t.get_text(strip=True))
+
+            item["tags"] = tags if tags else None
+            item["price_label"] = price
+
+            # ---------- RELEASE DATE ----------
+            date_div = li.select_one(".available_starting")
+            if date_div:
+                date_text = date_div.get_text(" ", strip=True)
+                item["release_date"] = date_text
+            else:
+                item["release_date"] = None
+
+            # ---------- SAVES ----------
+            saves = li.select_one(".saves")
+            item["saves"] = int(saves.get_text(strip=True)) if saves and saves.get_text(strip=True).isdigit() else None
+
+            # ---------- COMMENTS ----------
+            comments = li.select_one(".comments")
+            item["comments"] = int(comments.get_text(strip=True)) if comments else None
+
+            # ---------- RATING ----------
+            rating = li.select_one(".average_rating")
+            item["rating"] = rating.get_text(strip=True) if rating else None
+
+            # ---------- PRICING ----------
+            pricing = li.select_one(".ai_launch_date")
+            item["pricing_text"] = pricing.get_text(" ", strip=True) if pricing else None
+
+            # ---------- IMAGE ----------
+            img = li.select_one("img")
+            item["image"] = img.get("src") if img else None
+
+            items.append(item)
+        record["listings_count"] = len(items)
+        record["listings_json"] = json.dumps(items, ensure_ascii=False)
 
 
-        # -------------------------
-        # FAQ / Q&A extraction -> faq_json (list of {question, answer}) + faq_count
-        # -------------------------
-        faq_section = soup.find("section", id="faq")
-        if faq_section:
-            qa_items = []
-            # select all faq-info blocks except the ask_question one
-            for item in faq_section.select("div.faq-info"):
-                # skip the "ask_question" block if it has that class
-                if "ask_question" in (item.get("class") or []):
-                    continue
+        #--------------
+        #also searched for
+        #--------------
+        also_block = soup.find("div", class_="also_searched")
 
-                q_tag = item.find("div", class_="faq-info-title")
-                a_tag = item.find("div", class_="faq-info-description")
+        if also_block:
+            items = []
 
-                question = q_tag.get_text(" ", strip=True) if q_tag else None
-                answer = a_tag.get_text(" ", strip=True) if a_tag else None
+            for a in also_block.select(".also_searched_inner a[href]"):
+                text = a.get_text(strip=True)
+                href = a.get("href")
 
-                # only add if at least question or answer exists
-                if question or answer:
-                    qa_items.append({"question": question, "answer": answer})
-
-            record["faq_count"] = len(qa_items)
-            record["faq_json"] = json.dumps(qa_items, ensure_ascii=False) if qa_items else json.dumps([], ensure_ascii=False)
-        else:
-            record["faq_count"] = None
-            record["faq_json"] = None
-       
-
-       #-------------------------
-       # Featured cards and all tools extraction
-       #-------------------------
-        featured_block = soup.find("div", class_="in_content_featured")
-        cards_data = []
-
-        if featured_block:
-            cards = featured_block.select("li.standalone")
-
-            for li in cards:
-                # ids / attributes
-                ai_id = li.get("data-id")
-                name = li.get("data-name")
-                task_id = li.get("data-task_id")
-                fid = li.get("data-fid")
-                featured = li.get("data-featured") == "true"
-
-                # internal tool link
-                tool_a = li.find("a", class_="ai_link")
-                tool_link = urljoin(BASE_URL, tool_a.get("href")) if tool_a else None
-
-                # external website
-                ext_a = li.find("a", class_="external_ai_link")
-                external_link = urljoin(BASE_URL, ext_a.get("href")) if ext_a else None
-
-                # task
-                task_a = li.find("a", class_="task_label")
-                task_name = task_a.get_text(" ", strip=True) if task_a else None
-                task_link = urljoin(BASE_URL, task_a.get("href")) if task_a else None
-
-                # description
-                desc_tag = li.find("div", class_="short_desc")
-                description = desc_tag.get_text(" ", strip=True) if desc_tag else None
-
-                # saves
-                saves_tag = li.find("div", class_="saves")
-                saves = to_int_or_none(saves_tag.get_text(strip=True)) if saves_tag else None
-
-                # rating
-                rating_tag = li.find("div", class_="average_rating")
-                rating = (rating_tag.get_text(strip=True)) if rating_tag else None
-
-                ratings_count = None
-                rc_tag = li.find("span", class_="ratings_count")
-                if rc_tag:
-                    ratings_count = to_int_or_none(rc_tag.get_text(strip=True))
-
-                # pricing
-                price_tag = li.find("a", class_="ai_launch_date")
-                pricing = price_tag.get_text(" ", strip=True) if price_tag else None
-
-                # screenshot
-                img = li.find("img", class_="ai_image")
-                screenshot = urljoin(BASE_URL, img.get("src")) if img else None
-
-                cards_data.append({
-                    "id": ai_id,
-                    "name": name,
-                    "tool_link": tool_link,
-                    "external_link": external_link,
-                    "task_name": task_name,
-                    "task_link": task_link,
-                    "description": description,
-                    "saves": saves,
-                    "average_rating": rating,
-                    "ratings_count": ratings_count,
-                    "pricing": pricing,
-                    "screenshot": screenshot,
-                    "featured": featured,
-                    "task_id": task_id,
-                    "fid": fid
+                items.append({
+                    "query": text,
+                    "link": urljoin(BASE_URL, href)
                 })
 
-        record["featured_cards_count"] = len(cards_data)
-        record["featured_cards_json"] = json.dumps(cards_data, ensure_ascii=False)
+            record["also_searched_count"] = len(items)
+            record["also_searched_json"] = json.dumps(items, ensure_ascii=False)
 
-        #-------------------------
-        # All tools extraction
-        #-------------------------
-        cards_data = []
-
-        cards = soup.find_all("li", attrs={"data-id": True, "data-name": True})
-
-        for li in cards:
-            ai_id = li.get("data-id")
-            name = li.get("data-name")
-            task = li.get("data-task")
-            task_id = li.get("data-task_id")
-            task_slug = li.get("data-task_slug")
-
-            # internal tool page
-            tool_a = li.find("a", class_="ai_link")
-            tool_link = urljoin(BASE_URL, tool_a.get("href")) if tool_a else None
-
-            # external website
-            ext_a = li.find("a", class_="external_ai_link")
-            external_link = urljoin(BASE_URL, ext_a.get("href")) if ext_a else None
-
-            # task label
-            task_a = li.find("a", class_="task_label")
-            task_name = task_a.get_text(" ", strip=True) if task_a else task
-            task_link = urljoin(BASE_URL, task_a.get("href")) if task_a else None
-
-            # description
-            desc_tag = li.find("div", class_="short_desc")
-            description = desc_tag.get_text(" ", strip=True) if desc_tag else None
-
-            # saves
-            saves_tag = li.find("div", class_="saves")
-            saves = to_int_or_none(saves_tag.get_text(strip=True)) if saves_tag else None
-
-            # pricing
-            price_tag = li.find("a", class_="ai_launch_date")
-            pricing = price_tag.get_text(" ", strip=True) if price_tag else None
-
-            # icon
-            img = li.find("img")
-            icon = urljoin(BASE_URL, img.get("src")) if img and img.get("src") else None
-
-            cards_data.append({
-                "id": ai_id,
-                "name": name,
-                "tool_link": tool_link,
-                "external_link": external_link,
-                "task_name": task_name,
-                "task_link": task_link,
-                "description": description,
-                "saves": saves,
-                "pricing": pricing,
-                "icon": icon,
-                "task_id": task_id,
-                "task_slug": task_slug
-            })
-
-        record["tools_count"] = len(cards_data)
-        record["tools_json"] = json.dumps(cards_data, ensure_ascii=False)
-
+        else:
+            record["also_searched_count"] = 0
+            record["also_searched_json"] = json.dumps([], ensure_ascii=False)
 
     except Exception as e:
         print(f"[get_cols] unexpected error on : {e}")
