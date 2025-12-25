@@ -58,7 +58,6 @@ COLUMNS = [
     "use_case_created_date",
     "link",
     "tool_link",
-    "description",
     "rank_task_name",
     "rank_full_text",
     "rank_number",
@@ -258,6 +257,8 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
     record["snapshot_url"] = snapshot_url
     record["link"] = snapshot_url
     try:
+        soup = BeautifulSoup(html, "html.parser")
+
         h1 = soup.find("h1")
         if h1:
             # -------- use case name (Chatting) --------
