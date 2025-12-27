@@ -127,8 +127,28 @@ def extract_comments(li):
     return None
 
 def extract_rating(li):
-    el = li.select_one(".average_rating")
-    return safe_float(el.text) if el else None
+    # 1️⃣ Canonical (2024–2025)
+    for sel in [
+        ".average_rating"
+    ]:
+        el = li.select_one(sel)
+        if el:
+            return safe_float(el.text)
+
+    # 2️⃣ 2023 stats_right pattern (e.g. JungGPT)
+    for sel in [
+        ".stats .stats_right",
+    ]:
+        el = li.select_one(sel)
+        if el:
+            txt = el.get_text(" ", strip=True)
+            # match exactly one decimal rating like 5.0, 4.3, etc.
+            m = re.search(r"\b\d\.\d\b", txt)
+            if m:
+                return float(m.group(0))
+
+    return None
+
 
 def extract_views(li):
     for sel in [
