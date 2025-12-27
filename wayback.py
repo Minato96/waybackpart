@@ -1,336 +1,285 @@
-#!/usr/bin/env python3
-"""
-taaft_wayback_timeseries_FINAL_LOCKED.py
+# ============================================================
+# DAILY UPDATE (robust):
+# - Scrape only current + previous month /period/ pages
+# - Wait + scroll for lazy-loaded cards
+# - Canonicalize tool URLs to /ai/<slug>
+# - Append only truly new URLs into taaft_tools_2015_2025.csv
+# - Optional debug dumps when pages look blocked/empty
+# ============================================================
 
-• Homepage cards across ALL Wayback eras (2015–2025+)
-• STRICT extraction for quantitative metrics (no guessing)
-• Heuristic extraction ONLY for pricing & release
-• Progress bars, retries, rate limit, waits, checkpoint
-• Monotonic: new logic only ADDS fallbacks
-"""
-
-import asyncio
-import aiohttp
-import pandas as pd
-import time
-import json
-import random
 import os
 import re
-from typing import List, Dict, Optional
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from tqdm import tqdm
+import time
+import pandas as pd
+from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
-# ================= CONFIG =================
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 
-TARGET_URL = "https://theresanaiforthat.com/"
-BASE_URL = "https://theresanaiforthat.com/"
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-OUT_CSV = "taaft_tools_timeseries.csv"
-CHECKPOINT_FILE = "wayback_checkpoint.json"
+# ---------------- CONFIG ----------------
+BASE = "https://theresanaiforthat.com"
+CSV_PATH = "taaft_tools_2015_2025.csv"
 
-WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
-WAYBACK_FROM = "2015"
-WAYBACK_TO = "2025"
-WAYBACK_FILTER = "statuscode:200"
+HEADLESS = True
+SETTLE_SEC = 0.3              # used only for tiny settle after scroll
+PAGE_DELAY_SEC = 0.5
+MAX_PAGES_CAP = 30
 
-REQUESTS_PER_MIN = 60
-TIMEOUT = 30
-MAX_RETRIES = 10
-BACKOFF_BASE = 1.7
-SAVE_EVERY = 50
-SNAPSHOT_DELAY = 0.3
+# keep current + previous month (update manually)
+PERIOD_SLUGS = ["just-released"]
 
-# ================= RATE LIMITER =================
+# Debug: save HTML for the first page of each period if no anchors found
+DEBUG_DUMP_ON_EMPTY = True
+DEBUG_DIR = "taaft_debug_html"
+# --------------------------------------
 
-class RateLimiter:
-    def __init__(self, rate):
-        self.capacity = rate
-        self.tokens = rate
-        self.last = time.time()
-        self.lock = asyncio.Lock()
 
-    async def acquire(self):
-        while True:
-            async with self.lock:
-                now = time.time()
-                elapsed = now - self.last
-                self.tokens = min(
-                    self.capacity,
-                    self.tokens + elapsed * (self.capacity / 60)
-                )
-                self.last = now
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-            await asyncio.sleep(0.05)
+# ---------------- DRIVER ----------------
+def build_driver(headless: bool = True) -> webdriver.Chrome:
+    opts = Options()
 
-RATE_LIMITER = RateLimiter(REQUESTS_PER_MIN)
+    if headless:
+        opts.add_argument("--headless=new")
 
-# ================= HELPERS =================
+    # Stability / performance
+    opts.add_argument("--window-size=1920,1200")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Mozilla/5.0 (X11; Linux x86_64)",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-]
-
-PRICE_RE = re.compile(r"(free|from\s*\$\d+|\$\d+)", re.I)
-RELATIVE_RE = re.compile(r"\b\d+\s*(h|d|w|m|y)\s*ago\b", re.I)
-
-def headers():
-    return {"User-Agent": random.choice(USER_AGENTS)}
-
-def safe_int(txt):
-    try:
-        return int(txt.replace(",", "").strip())
-    except:
-        return None
-
-def safe_float(txt):
-    try:
-        return float(txt.strip())
-    except:
-        return None
-
-def first_text(li, selectors: List[str]) -> Optional[str]:
-    for sel in selectors:
-        el = li.select_one(sel)
-        if el:
-            txt = el.get_text(strip=True)
-            if txt:
-                return txt
-    return None
-
-def first_attr(li, selectors: List[str], attr: str) -> Optional[str]:
-    for sel in selectors:
-        el = li.select_one(sel)
-        if el and el.get(attr):
-            return el.get(attr)
-    return None
-
-# ================= STRICT METRIC EXTRACTORS =================
-# (NO GUESSING — ONLY REAL TAGS)
-
-def extract_saves(li):
-    el = li.select_one(".saves")
-    return safe_int(el.text) if el else None
-
-def extract_comments(li):
-    for sel in [
-        ".comments"
-    ]:
-        el = li.select_one(sel)
-        if el:
-            return safe_int(el.text)
-    return None
-
-def extract_rating(li):
-    el = li.select_one(".average_rating")
-    return safe_float(el.text) if el else None
-
-def extract_views(li):
-    for sel in [
-        ".stats_views span",
-        ".views_count",
-        ".views_count_count"
-    ]:
-        el = li.select_one(sel)
-        if el:
-            return safe_int(el.text)
-    return None
-
-# ================= SEMANTIC (SAFE) EXTRACTORS =================
-
-def extract_pricing(li):
-    # Newest / structured
-    txt = first_text(li, [".ai_launch_date"])
-    if txt:
-        return txt
-
-    # Early 2023
-    txt = first_text(li, [".tags .tag.price"])
-    if txt:
-        return txt
-
-    # Late 2022
-    txt = first_text(li, [".tags .price"])
-    if txt:
-        return txt
-
-    return None
-
-def extract_release(li):
-    # 2024–2025 relative release
-    txt = first_text(li, [".released .relative"])
-    if txt:
-        return txt
-
-    # Older absolute release
-    txt = first_text(li, [".available_starting"])
-    if txt:
-        return txt.replace("Released", "").strip()
-
-    # Attribute-based (2025)
-    if li.get("data-release"):
-        return li.get("data-release")
-
-    return None
-
-def extract_tags(li):
-    tags = []
-    for el in li.select(".tags span"):
-        t = el.get_text(strip=True)
-        if t and not PRICE_RE.search(t):
-            tags.append(t)
-    return ",".join(tags) if tags else None
-
-# ================= NETWORK =================
-
-async def fetch(session, url, context=""):
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            await RATE_LIMITER.acquire()
-            async with session.get(url, headers=headers(), timeout=TIMEOUT) as r:
-                if r.status == 200:
-                    return await r.text(errors="ignore"), None
-                wait = BACKOFF_BASE ** attempt
-                tqdm.write(f"[retry {attempt}] {context} HTTP {r.status} → wait {wait:.1f}s")
-                await asyncio.sleep(wait)
-        except Exception as e:
-            last_err = e
-            wait = BACKOFF_BASE ** attempt
-            tqdm.write(f"[retry {attempt}] {context} exception → wait {wait:.1f}s")
-            await asyncio.sleep(wait)
-    return None, str(last_err)
-
-async def query_cdx(session):
-    q = (
-        f"{WAYBACK_CDX_URL}?url={TARGET_URL}"
-        f"&from={WAYBACK_FROM}&to={WAYBACK_TO}"
-        f"&output=json&filter={WAYBACK_FILTER}&collapse=timestamp"
+    # Reduce “automation obviousness” (helps sometimes)
+    opts.add_argument("--lang=en-US")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     )
-    text, _ = await fetch(session, q, "CDX")
-    data = json.loads(text)
-    return [
-        {
-            "timestamp": row[1],
-            "snapshot_url": f"https://web.archive.org/web/{row[1]}/{TARGET_URL}"
-        }
-        for row in data[1:]
-    ]
 
-# ================= PARSER =================
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
 
-def parse_snapshot(html, ts, snap_url):
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
-
-    for li in soup.select("li.li"):
-        r = {
-            "snapshot_timestamp": ts,
-            "snapshot_url": snap_url,
-            "tool_id": li.get("data-id"),
-            "tool_name": li.get("data-name") or first_text(li, ["a.ai_link"]),
-            "raw_classes": " ".join(li.get("class", [])),
-            "internal_link": None,
-            "external_link": None,
-            "tags": extract_tags(li),
-            "pricing_text": extract_pricing(li),
-            "release_text": extract_release(li),
-            "saves": extract_saves(li),
-            "comments": extract_comments(li),
-            "rating": extract_rating(li),
-            "views": extract_views(li),
-            "has_video": "has_video" in li.get("class", []),
-            "has_comment": "has_comment" in li.get("class", []),
-            "is_verified": "verified" in li.get("class", []),
-            "is_pinned": "is_pinned" in li.get("class", []),
-            "share_slug": first_attr(li, [".share_ai"], "data-slug"),
-        }
-
-        internal = first_attr(li, ["a.ai_link[href*='/ai/']"], "href")
-        external = first_attr(
-            li,
-            ["a.external_ai_link", "a.ai_link[target='_blank']"],
-            "href"
+    # Hide navigator.webdriver
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"},
         )
+    except Exception:
+        pass
 
-        if internal:
-            r["internal_link"] = urljoin(BASE_URL, internal)
-        if external:
-            r["external_link"] = urljoin(BASE_URL, external)
+    driver.set_page_load_timeout(45)
+    return driver
 
-        rows.append(r)
 
-    return rows
+# ---------------- URL HELPERS ----------------
+def normalize_url(u: str) -> str:
+    parts = urlsplit(u)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
-# ================= CHECKPOINT =================
 
-def load_checkpoint():
-    if not os.path.exists(CHECKPOINT_FILE):
-        return set()
-    with open(CHECKPOINT_FILE) as f:
-        return set(json.load(f))
+def canonical_tool_url(u: str) -> str:
+    """
+    Accept anything containing /ai/<slug> and canonicalize to:
+      https://theresanaiforthat.com/ai/<slug>
+    This survives site changes like /ai/<slug>/reviews or query params.
+    """
+    parts = urlsplit(u)
+    m = re.search(r"(/ai/[a-z0-9\-]+)", parts.path, re.I)
+    if not m:
+        return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+    return urlunsplit((parts.scheme, parts.netloc, m.group(1).rstrip("/"), "", ""))
 
-def save_checkpoint(done):
-    with open(CHECKPOINT_FILE + ".tmp", "w") as f:
-        json.dump(list(done), f)
-    os.replace(CHECKPOINT_FILE + ".tmp", CHECKPOINT_FILE)
 
-# ================= MAIN =================
+def guess_name_from_context(text: str, url: str) -> str:
+    text = (text or "").strip()
+    if text and not re.fullmatch(r"(read more|view|open|details|visit|learn more)", text, re.I):
+        return re.sub(r"\s+", " ", text)
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        snapshots = await query_cdx(session)
-        done = load_checkpoint()
+    m = re.search(r"/ai/([^/]+)/?$", url)
+    if m:
+        return re.sub(r"[-_]+", " ", m.group(1)).strip().title()
+    return url
 
-        snap_bar = tqdm(total=len(snapshots), desc="Snapshots")
-        row_bar = tqdm(desc="Rows")
 
-        buffer = []
+# ---------------- PAGE HARVESTING ----------------
+def harvest_listing_links_js(driver) -> list[dict]:
+    """
+    Collect all anchors containing /ai/ from the DOM.
+    We do NOT enforce strict /ai/<slug> shape in JS; we canonicalize in Python.
+    """
+    script = r"""
+    const out = [];
+    const anchors = Array.from(document.querySelectorAll('a[href*="/ai/"]'));
+    const seen = new Set();
 
-        for snap in snapshots:
-            ts = snap["timestamp"]
-            if ts in done:
-                snap_bar.update(1)
-                continue
+    function abs(u){
+      try { return new URL(u, window.location.origin).href; }
+      catch(e){ return null; }
+    }
 
-            html, _ = await fetch(session, snap["snapshot_url"], f"snapshot {ts}")
-            if html:
-                rows = parse_snapshot(html, ts, snap["snapshot_url"])
-                buffer.extend(rows)
-                row_bar.update(len(rows))
+    for (const a of anchors){
+      const href = abs(a.getAttribute("href") || "");
+      if(!href) continue;
+      if(seen.has(href)) continue;
+      seen.add(href);
 
-            done.add(ts)
-            snap_bar.update(1)
-            snap_bar.set_postfix(buf=len(buffer))
+      let label = (a.textContent||'').trim()
+               || a.getAttribute('aria-label')
+               || a.getAttribute('title')
+               || '';
 
-            if len(buffer) >= SAVE_EVERY:
-                pd.DataFrame(buffer).to_csv(
-                    OUT_CSV,
-                    mode="a",
-                    header=not os.path.exists(OUT_CSV),
-                    index=False
-                )
-                buffer.clear()
-                save_checkpoint(done)
+      if(!label){
+        const card = a.closest('article, .card, .tool-card, .listing__item, li, .box, .result, .entry');
+        if(card){
+          const h = card.querySelector('h1,h2,h3,.title,.tool-title');
+          if(h) label = (h.textContent||'').trim();
+        }
+      }
+      out.push({name: label, url: href});
+    }
+    return out;
+    """
+    return driver.execute_script(script)
 
-            await asyncio.sleep(SNAPSHOT_DELAY)
 
-        if buffer:
-            pd.DataFrame(buffer).to_csv(
-                OUT_CSV,
-                mode="a",
-                header=not os.path.exists(OUT_CSV),
-                index=False
-            )
-            save_checkpoint(done)
+def scroll_to_load(driver, max_rounds: int = 8, pause: float = 0.8) -> None:
+    """
+    Scroll until the page height stops growing (lazy-loading trigger).
+    """
+    last_h = driver.execute_script("return document.body.scrollHeight") or 0
+    for _ in range(max_rounds):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(pause)
+        new_h = driver.execute_script("return document.body.scrollHeight") or 0
+        if new_h <= last_h + 5:
+            break
+        last_h = new_h
+    time.sleep(SETTLE_SEC)
 
-        snap_bar.close()
-        row_bar.close()
+
+def dump_debug_html(period_slug: str, p: int, html: str) -> None:
+    if not DEBUG_DUMP_ON_EMPTY:
+        return
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    fp = os.path.join(DEBUG_DIR, f"debug_{period_slug}_p{p}.html")
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(html or "")
+
+
+def scrape_just_released(driver, existing_urls: set[str]) -> pd.DataFrame:
+    new_rows: list[dict] = []
+    wait = WebDriverWait(driver, 20)
+
+    page_url = f"{BASE}/just-released/"
+    driver.get(page_url)
+
+    # Wait for real cards, not navbar junk
+    wait.until(lambda d: len(
+        d.find_elements(By.CSS_SELECTOR, 'article a[href*="/ai/"]')
+    ) >= 5)
+
+    # Aggressive scroll for infinite load
+    scroll_to_load(driver, max_rounds=20, pause=1.0)
+
+    items = harvest_listing_links_js(driver)
+
+    for it in items:
+        raw_url = it.get("url") or ""
+        if "/ai/" not in raw_url:
+            continue
+
+        url = canonical_tool_url(raw_url)
+        if url in existing_urls:
+            continue
+
+        name = guess_name_from_context(it.get("name", ""), url)
+
+        existing_urls.add(url)
+        new_rows.append({
+            "tool_name": name,
+            "tool_url": url,
+            "period": "just-released"
+        })
+
+    return pd.DataFrame(new_rows)
+
+
+# ---------------- MAIN ----------------
+def main():
+    if not os.path.exists(CSV_PATH):
+        raise FileNotFoundError(f"Missing {CSV_PATH}")
+
+    df = pd.read_csv(CSV_PATH)
+    df.columns = [c.strip() for c in df.columns]
+
+    if "tool_url" not in df.columns:
+        raise ValueError("CSV must contain column 'tool_url'")
+
+    if "tool_name" not in df.columns:
+        # not fatal; just ensure it exists
+        df["tool_name"] = ""
+
+    df["tool_url"] = df["tool_url"].astype(str).map(canonical_tool_url)
+
+    prev_n = len(df)
+    existing_urls = set(df["tool_url"].dropna().astype(str).tolist())
+    print(f"[BASE] rows before: {prev_n}")
+
+    driver = build_driver(headless=HEADLESS)
+    all_new = []
+    try:
+        for slug in PERIOD_SLUGS:
+            print(f"\nScraping /period/{slug}/ ...")
+            df_new = scrape_just_released(driver, existing_urls)
+            print(f"New URLs from {slug}: {len(df_new)}")
+            all_new.append(df_new)
+    finally:
+        driver.quit()
+
+    new_df = pd.concat(all_new, ignore_index=True) if all_new else pd.DataFrame()
+
+    # Assign year (simple rule: current year; adjust if you cross Jan and want previous year)
+    year_now = datetime.now().year
+
+    if len(new_df):
+        new_df.insert(0, "year", year_now)
+
+        # produce output with only the columns you want appended
+        append_df = new_df[["year", "tool_name", "tool_url"]].copy()
+        append_df["tool_url"] = append_df["tool_url"].astype(str).map(canonical_tool_url)
+        append_df["tool_name"] = append_df["tool_name"].astype(str)
+
+        out = pd.concat([df, append_df], ignore_index=True)
+        out["tool_url"] = out["tool_url"].astype(str).map(canonical_tool_url)
+        out["tool_name"] = out["tool_name"].astype(str)
+
+        # dedupe by URL (keep first existing)
+        out = out.drop_duplicates(subset=["tool_url"], keep="first").reset_index(drop=True)
+
+        out.to_csv(CSV_PATH, index=False)
+
+        added = len(append_df)
+        print(f"\n[UPDATE] added {added} new tools. final rows: {len(out)}. saved -> {CSV_PATH}")
+
+        # Print sample
+        print("\n[NEW SAMPLE]")
+        print(append_df.head(50).to_string(index=False))
+    else:
+        print("\n[UPDATE] added 0 new tools (no changes).")
+        if HEADLESS:
+            print("If you *expect* new tools today, try running once with HEADLESS=False to test for headless blocking.")
+        if DEBUG_DUMP_ON_EMPTY:
+            print(f"If warnings occurred, inspect HTML dumps in: {os.path.abspath(DEBUG_DIR)}")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
