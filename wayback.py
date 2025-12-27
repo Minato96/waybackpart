@@ -118,8 +118,13 @@ def extract_saves(li):
     return safe_int(el.text) if el else None
 
 def extract_comments(li):
-    el = li.select_one(".comments")
-    return safe_int(el.text) if el else None
+    for sel in [
+        ".comments"
+    ]:
+        el = li.select_one(sel)
+        if el:
+            return safe_int(el.text)
+    return None
 
 def extract_rating(li):
     el = li.select_one(".average_rating")
