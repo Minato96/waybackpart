@@ -132,10 +132,22 @@ def harvest_listing_links_js(driver) -> list[dict]:
       if(seen.has(href)) continue;
       seen.add(href);
 
-      let label = (a.textContent||'').trim()
-               || a.getAttribute('aria-label')
-               || a.getAttribute('title')
-               || '';
+      let label = '';
+
+      const li = a.closest('li[data-name]');
+      if (li && li.dataset && li.dataset.name) {
+      label = li.dataset.name.trim();
+      }
+
+      if (!label) {
+      const span = a.querySelector('span');
+      if (span) label = span.textContent.trim();
+      }
+
+      if (!label) {
+      label = (a.textContent || '').trim();
+      }
+
 
       if(!label){
         const card = a.closest('article, .card, .tool-card, .listing__item, li, .box, .result, .entry');
@@ -183,9 +195,13 @@ def scrape_just_released(driver, existing_urls: set[str]) -> pd.DataFrame:
     driver.get(page_url)
 
     # Wait for real cards, not navbar junk
-    wait.until(lambda d: len(
-        d.find_elements(By.CSS_SELECTOR, 'article a[href*="/ai/"]')
-    ) >= 5)
+    # Give JS some breathing room
+    time.sleep(3)
+
+    # Trigger initial scroll to force React hydration
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
+
 
     # Aggressive scroll for infinite load
     scroll_to_load(driver, max_rounds=20, pause=1.0)
