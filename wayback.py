@@ -27,7 +27,7 @@ from tqdm import tqdm
 TARGET_URL = "https://theresanaiforthat.com/"
 BASE_URL = "https://theresanaiforthat.com/"
 
-OUT_CSV = "taaft_tools_timeseries.csv"
+OUT_CSV = "taaft_tools_timeseries2.csv"
 CHECKPOINT_FILE = "wayback_checkpoint.json"
 
 WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
