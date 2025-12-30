@@ -24,10 +24,26 @@ from tqdm import tqdm
 
 # ================= CONFIG =================
 
-TARGET_URL = "https://theresanaiforthat.com/"
+TARGET_URLS = [
+    "https://theresanaiforthat.com/most-saved/",
+    "https://theresanaiforthat.com/s/free/",
+    "https://theresanaiforthat.com/period/january/",
+    "https://theresanaiforthat.com/period/february/",
+    "https://theresanaiforthat.com/period/march/",
+    "https://theresanaiforthat.com/period/april/",
+    "https://theresanaiforthat.com/period/may/",
+    "https://theresanaiforthat.com/period/june/",
+    "https://theresanaiforthat.com/period/july/",
+    "https://theresanaiforthat.com/period/august/",
+    "https://theresanaiforthat.com/period/september/",
+    "https://theresanaiforthat.com/period/october/",
+    "https://theresanaiforthat.com/period/november/",
+    "https://theresanaiforthat.com/period/december/",
+]
+
 BASE_URL = "https://theresanaiforthat.com/"
 
-OUT_CSV = "taaft_tools_timeseries2.csv"
+OUT_CSV = "taaft_tools_timeseries_per_ms_free.csv"
 CHECKPOINT_FILE = "wayback_checkpoint.json"
 
 WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
@@ -226,25 +242,27 @@ async def fetch(session, url, context=""):
             await asyncio.sleep(wait)
     return None, str(last_err)
 
-async def query_cdx(session):
+async def query_cdx(session, target_url):
     q = (
-        f"{WAYBACK_CDX_URL}?url={TARGET_URL}"
+        f"{WAYBACK_CDX_URL}?url={target_url}"
         f"&from={WAYBACK_FROM}&to={WAYBACK_TO}"
         f"&output=json&filter={WAYBACK_FILTER}&collapse=timestamp"
     )
-    text, _ = await fetch(session, q, "CDX")
+    text, _ = await fetch(session, q, f"CDX {target_url}")
     data = json.loads(text)
     return [
         {
             "timestamp": row[1],
-            "snapshot_url": f"https://web.archive.org/web/{row[1]}/{TARGET_URL}"
+            "snapshot_url": f"https://web.archive.org/web/{row[1]}/{target_url}",
+            "source_url": target_url
         }
         for row in data[1:]
     ]
 
+
 # ================= PARSER =================
 
-def parse_snapshot(html, ts, snap_url):
+def parse_snapshot(html, ts, snap_url,source_url):
     soup = BeautifulSoup(html, "html.parser")
     rows = []
 
@@ -269,6 +287,7 @@ def parse_snapshot(html, ts, snap_url):
             "is_verified": "verified" in li.get("class", []),
             "is_pinned": "is_pinned" in li.get("class", []),
             "share_slug": first_attr(li, [".share_ai"], "data-slug"),
+            "source_url": source_url,
         }
 
         internal = first_attr(li, ["a.ai_link[href*='/ai/']"], "href")
@@ -304,7 +323,14 @@ def save_checkpoint(done):
 
 async def main():
     async with aiohttp.ClientSession() as session:
-        snapshots = await query_cdx(session)
+        snapshots = []
+        for url in TARGET_URLS:
+            snaps = await query_cdx(session, url)
+            snapshots.extend(snaps)
+
+        # sort AFTER collecting all snapshots
+        snapshots.sort(key=lambda x: (x["source_url"], x["timestamp"]))
+
         done = load_checkpoint()
 
         snap_bar = tqdm(total=len(snapshots), desc="Snapshots")
@@ -314,17 +340,24 @@ async def main():
 
         for snap in snapshots:
             ts = snap["timestamp"]
-            if ts in done:
+            key = f"{snap['source_url']}|{ts}"
+
+            if key in done:
                 snap_bar.update(1)
                 continue
 
             html, _ = await fetch(session, snap["snapshot_url"], f"snapshot {ts}")
             if html:
-                rows = parse_snapshot(html, ts, snap["snapshot_url"])
+                rows = parse_snapshot(
+                        html,
+                        ts,
+                        snap["snapshot_url"],
+                        snap["source_url"]
+                    )
                 buffer.extend(rows)
                 row_bar.update(len(rows))
 
-            done.add(ts)
+            done.add(key)
             snap_bar.update(1)
             snap_bar.set_postfix(buf=len(buffer))
 
