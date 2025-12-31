@@ -965,7 +965,9 @@ def save_checkpoint(done):
 async def main():
     async with aiohttp.ClientSession() as session:
         snapshots = []
-        for url in TARGET_URLS:
+        cdx_bar = tqdm(TARGET_URLS, desc="CDX URLs")
+        for url in cdx_bar:
+            cdx_bar.set_postfix(url=url.split("/")[-2])
             snaps = await query_cdx(session, url)
             snapshots.extend(snaps)
 
