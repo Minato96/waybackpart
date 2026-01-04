@@ -53,6 +53,9 @@ CHECKPOINT_FILE = "wayback_checkpoint.json"  # stores processed keys set (saves 
 # Columns (keeps your parsing outputs + wayback fields)
 
 COLUMNS = [
+    "original_url",
+    "snapshot_timestamp",
+    "snapshot_url",
     "use_case_name",
     "use_case_category",
     "use_case_created_date",
