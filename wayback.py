@@ -17,12 +17,12 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
 CSV_IN  = "ai_tools_progress_04012026.csv"
-CSV_OUT = "task_audit.csv"
+CSV_OUT = "task_audit_2.csv"
 
 SLEEP_BETWEEN = 0.03
 CHECKPOINT_EVERY = 50      # ✅ changed to 50
 MAX_RETRIES = 6
-TIMEOUT = 30
+TIMEOUT = 100
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
@@ -269,11 +269,6 @@ def main():
 
             row = {"task_label_url": df_in.at[idx, "task_label_url"]}
             row.update(result)
-
-            if url in done_urls:
-                continue   # already written by another thread
-
-            done_urls.add(url)
 
             df_out = pd.concat(
                 [df_out, pd.DataFrame([row])],
