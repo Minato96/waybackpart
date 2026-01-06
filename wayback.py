@@ -1,300 +1,209 @@
-# ============================================================
-# DAILY UPDATE (robust):
-# - Scrape only current + previous month /period/ pages
-# - Wait + scroll for lazy-loaded cards
-# - Canonicalize tool URLs to /ai/<slug>
-# - Append only truly new URLs into taaft_tools_2015_2025.csv
-# - Optional debug dumps when pages look blocked/empty
-# ============================================================
-
 import os
-import re
 import time
+import random
+import logging
 import pandas as pd
-from datetime import datetime
+import requests
+from collections import Counter
 from urllib.parse import urlsplit, urlunsplit
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from tqdm import tqdm
 
 # ---------------- CONFIG ----------------
-BASE = "https://theresanaiforthat.com"
-CSV_PATH = "taaft_tools_2015_2025.csv"
+TIMEMAP_CDX = "https://web.archive.org/web/timemap/cdx"
 
-HEADLESS = True
-SETTLE_SEC = 0.3              # used only for tiny settle after scroll
-PAGE_DELAY_SEC = 0.5
-MAX_PAGES_CAP = 30
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
-# keep current + previous month (update manually)
-PERIOD_SLUGS = ["just-released"]
+CSV_IN  = "ai_tools_progress_04012026.csv"
+CSV_OUT = "task_audit.csv"
 
-# Debug: save HTML for the first page of each period if no anchors found
-DEBUG_DUMP_ON_EMPTY = True
-DEBUG_DIR = "taaft_debug_html"
-# --------------------------------------
+SLEEP_BETWEEN = 0.03
+CHECKPOINT_EVERY = 50      # ✅ changed to 50
+MAX_RETRIES = 6
+TIMEOUT = 30
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA})
 
 
-# ---------------- DRIVER ----------------
-def build_driver(headless: bool = True) -> webdriver.Chrome:
-    opts = Options()
+MAX_BLUE_URLS_TO_STORE = None
 
-    if headless:
-        opts.add_argument("--headless=new")
+# ---------------- LOGGING ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("wayback-audit")
 
-    # Stability / performance
-    opts.add_argument("--window-size=1920,1200")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
 
-    # Reduce “automation obviousness” (helps sometimes)
-    opts.add_argument("--lang=en-US")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
+def normalize_variants(url: str) -> list[str]:
+    p = urlsplit(url)
+    base = urlunsplit((p.scheme or "https", p.netloc, p.path.rstrip("/"), "", ""))
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=opts)
+    variants = [
+        base,
+        base + "/",
+        base.replace("https://", "http://"),
+        base.replace("https://", "http://") + "/",
+    ]
 
-    # Hide navigator.webdriver
+    out, seen = [], set()
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _safe_int(x):
     try:
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"},
-        )
+        return int(x)
     except Exception:
-        pass
-
-    driver.set_page_load_timeout(45)
-    return driver
+        return None
 
 
-# ---------------- URL HELPERS ----------------
-def normalize_url(u: str) -> str:
-    parts = urlsplit(u)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+def wayback_status_breakdown(url: str, session, *, match_type="exact"):
+    sess = session   # reuse session for efficiency
+    headers = {"User-Agent": UA}
 
+    seen_keys = set()
+    status_counter = Counter()
+    ok_snapshots = []
+    unknown = 0
 
-def canonical_tool_url(u: str) -> str:
-    """
-    Accept anything containing /ai/<slug> and canonicalize to:
-      https://theresanaiforthat.com/ai/<slug>
-    This survives site changes like /ai/<slug>/reviews or query params.
-    """
-    parts = urlsplit(u)
-    m = re.search(r"(/ai/[a-z0-9\-]+)", parts.path, re.I)
-    if not m:
-        return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
-    return urlunsplit((parts.scheme, parts.netloc, m.group(1).rstrip("/"), "", ""))
-
-
-def guess_name_from_context(text: str, url: str) -> str:
-    text = (text or "").strip()
-    if text and not re.fullmatch(r"(read more|view|open|details|visit|learn more)", text, re.I):
-        return re.sub(r"\s+", " ", text)
-
-    m = re.search(r"/ai/([^/]+)/?$", url)
-    if m:
-        return re.sub(r"[-_]+", " ", m.group(1)).strip().title()
-    return url
-
-
-# ---------------- PAGE HARVESTING ----------------
-def harvest_listing_links_js(driver) -> list[dict]:
-    """
-    Collect all anchors containing /ai/ from the DOM.
-    We do NOT enforce strict /ai/<slug> shape in JS; we canonicalize in Python.
-    """
-    script = r"""
-    const out = [];
-    const anchors = Array.from(document.querySelectorAll('a[href*="/ai/"]'));
-    const seen = new Set();
-
-    function abs(u){
-      try { return new URL(u, window.location.origin).href; }
-      catch(e){ return null; }
-    }
-
-    for (const a of anchors){
-      const href = abs(a.getAttribute("href") || "");
-      if(!href) continue;
-      if(seen.has(href)) continue;
-      seen.add(href);
-
-      let label = '';
-
-      const li = a.closest('li[data-name]');
-      if (li && li.dataset && li.dataset.name) {
-      label = li.dataset.name.trim();
-      }
-
-      if (!label) {
-      const span = a.querySelector('span');
-      if (span) label = span.textContent.trim();
-      }
-
-      if (!label) {
-      label = (a.textContent || '').trim();
-      }
-
-
-      if(!label){
-        const card = a.closest('article, .card, .tool-card, .listing__item, li, .box, .result, .entry');
-        if(card){
-          const h = card.querySelector('h1,h2,h3,.title,.tool-title');
-          if(h) label = (h.textContent||'').trim();
+    for variant in normalize_variants(url):
+        params = {
+            "url": variant,
+            "matchType": match_type,
+            "fl": "timestamp,original,statuscode",
         }
-      }
-      out.push({name: label, url: href});
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                r = sess.get(TIMEMAP_CDX, params=params, headers=headers, timeout=TIMEOUT)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    raise RuntimeError(f"Transient HTTP {r.status_code}")
+                r.raise_for_status()
+
+                if not r.text.strip():
+                    break
+
+                for line in r.text.splitlines():
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+
+                    ts, original = parts[0], parts[1]
+                    status_raw = parts[2] if len(parts) >= 3 else None
+
+                    key = (ts, original)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    status = _safe_int(status_raw)
+                    if status is None:
+                        unknown += 1
+                        continue
+
+                    status_counter[status] += 1
+                    if 200 <= status < 400:
+                        ok_snapshots.append(
+                            f"https://web.archive.org/web/{ts}/{original}"
+                        )
+
+                break
+
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    log.warning(f"Wayback failed after retries: {url} ({variant})")
+                sleep_s = 0.7 * (0.7 + 0.6 * random.random())
+                time.sleep(min(sleep_s, 15))
+
+    blue = sum(v for k, v in status_counter.items() if 200 <= k < 400)
+    orange = sum(v for k, v in status_counter.items() if 400 <= k < 500)
+    other = sum(v for k, v in status_counter.items() if k < 200 or k >= 500)
+
+    snapshots_ok = sorted(set(ok_snapshots))
+    if MAX_BLUE_URLS_TO_STORE is not None:
+        snapshots_ok = snapshots_ok[:MAX_BLUE_URLS_TO_STORE]
+
+    return {
+        "blue": blue,
+        "orange": orange,
+        "other": other,
+        "unknown_status": unknown,
+        "total_numeric_status": blue + orange + other,
+        "snapshots_ok": snapshots_ok,
     }
-    return out;
-    """
-    return driver.execute_script(script)
 
 
-def scroll_to_load(driver, max_rounds: int = 8, pause: float = 0.8) -> None:
-    """
-    Scroll until the page height stops growing (lazy-loading trigger).
-    """
-    last_h = driver.execute_script("return document.body.scrollHeight") or 0
-    for _ in range(max_rounds):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(pause)
-        new_h = driver.execute_script("return document.body.scrollHeight") or 0
-        if new_h <= last_h + 5:
-            break
-        last_h = new_h
-    time.sleep(SETTLE_SEC)
-
-
-def dump_debug_html(period_slug: str, p: int, html: str) -> None:
-    if not DEBUG_DUMP_ON_EMPTY:
-        return
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-    fp = os.path.join(DEBUG_DIR, f"debug_{period_slug}_p{p}.html")
-    with open(fp, "w", encoding="utf-8") as f:
-        f.write(html or "")
-
-
-def scrape_just_released(driver, existing_urls: set[str]) -> pd.DataFrame:
-    new_rows: list[dict] = []
-    wait = WebDriverWait(driver, 20)
-
-    page_url = f"{BASE}/just-released/"
-    driver.get(page_url)
-
-    # Wait for real cards, not navbar junk
-    # Give JS some breathing room
-    time.sleep(3)
-
-    # Trigger initial scroll to force React hydration
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
-
-
-    # Aggressive scroll for infinite load
-    scroll_to_load(driver, max_rounds=20, pause=1.0)
-
-    items = harvest_listing_links_js(driver)
-
-    for it in items:
-        raw_url = it.get("url") or ""
-        if "/ai/" not in raw_url:
-            continue
-
-        url = canonical_tool_url(raw_url)
-        if url in existing_urls:
-            continue
-
-        name = guess_name_from_context(it.get("name", ""), url)
-
-        existing_urls.add(url)
-        new_rows.append({
-            "tool_name": name,
-            "tool_url": url,
-            "period": "just-released"
-        })
-
-    return pd.DataFrame(new_rows)
-
-
-# ---------------- MAIN ----------------
 def main():
-    if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError(f"Missing {CSV_PATH}")
+    if os.path.exists(CSV_OUT):
+        df = pd.read_csv(CSV_OUT)
+        log.info("Resuming from existing output file")
+    else:
+        df = pd.read_csv(CSV_IN)
+        log.info("Loaded fresh input file")
 
-    df = pd.read_csv(CSV_PATH)
     df.columns = [c.strip() for c in df.columns]
 
-    if "tool_url" not in df.columns:
-        raise ValueError("CSV must contain column 'tool_url'")
+    required_col = "task_label_url"
+    if required_col not in df.columns:
+        raise ValueError(f"Missing column: {required_col}")
 
-    if "tool_name" not in df.columns:
-        # not fatal; just ensure it exists
-        df["tool_name"] = ""
+    out_cols = [
+        "wayback_blue",
+        "wayback_orange",
+        "wayback_other",
+        "wayback_unknown",
+        "wayback_total_numeric_status",
+        "wayback_blue_urls",
+        "wayback_blue_urls_count",
+    ]
+    for c in out_cols:
+        if c not in df.columns:
+            df[c] = pd.NA
 
-    df["tool_url"] = df["tool_url"].astype(str).map(canonical_tool_url)
+    todo = df.index[df["wayback_blue"].isna()].tolist()
+    log.info(f"Total rows: {len(df)} | Remaining: {len(todo)}")
 
-    prev_n = len(df)
-    existing_urls = set(df["tool_url"].dropna().astype(str).tolist())
-    print(f"[BASE] rows before: {prev_n}")
+    processed = 0
 
-    driver = build_driver(headless=HEADLESS)
-    all_new = []
-    try:
-        for slug in PERIOD_SLUGS:
-            print(f"\nScraping /period/{slug}/ ...")
-            df_new = scrape_just_released(driver, existing_urls)
-            print(f"New URLs from {slug}: {len(df_new)}")
-            all_new.append(df_new)
-    finally:
-        driver.quit()
+    for idx in tqdm(todo, desc="Wayback audit", unit="url"):
+        url = str(df.at[idx, required_col]).strip()
 
-    new_df = pd.concat(all_new, ignore_index=True) if all_new else pd.DataFrame()
+        if not url or url.lower() in ("nan", "none"):
+            df.loc[idx, out_cols] = [0, 0, 0, 0, 0, "", 0]
+            continue
 
-    # Assign year (simple rule: current year; adjust if you cross Jan and want previous year)
-    year_now = datetime.now().year
+        try:
+            res = wayback_status_breakdown(url, SESSION)
 
-    if len(new_df):
-        new_df.insert(0, "year", year_now)
+            df.at[idx, "wayback_blue"] = res["blue"]
+            df.at[idx, "wayback_orange"] = res["orange"]
+            df.at[idx, "wayback_other"] = res["other"]
+            df.at[idx, "wayback_unknown"] = res["unknown_status"]
+            df.at[idx, "wayback_total_numeric_status"] = res["total_numeric_status"]
 
-        # produce output with only the columns you want appended
-        append_df = new_df[["year", "tool_name", "tool_url"]].copy()
-        append_df["tool_url"] = append_df["tool_url"].astype(str).map(canonical_tool_url)
-        append_df["tool_name"] = append_df["tool_name"].astype(str)
+            blue_urls = res["snapshots_ok"]
+            df.at[idx, "wayback_blue_urls"] = "\n".join(blue_urls)
+            df.at[idx, "wayback_blue_urls_count"] = len(blue_urls)
 
-        out = pd.concat([df, append_df], ignore_index=True)
-        out["tool_url"] = out["tool_url"].astype(str).map(canonical_tool_url)
-        out["tool_name"] = out["tool_name"].astype(str)
+        except Exception as e:
+            log.error(f"Row failed idx={idx} url={url} -> {e}")
+            df.loc[idx, out_cols] = [0, 0, 0, 0, 0, "", 0]
 
-        # dedupe by URL (keep first existing)
-        out = out.drop_duplicates(subset=["tool_url"], keep="first").reset_index(drop=True)
+        processed += 1
+        if processed % CHECKPOINT_EVERY == 0:
+            df.to_csv(CSV_OUT, index=False)
+            log.info(f"Checkpoint saved ({processed} rows)")
 
-        out.to_csv(CSV_PATH, index=False)
+        time.sleep(SLEEP_BETWEEN)
 
-        added = len(append_df)
-        print(f"\n[UPDATE] added {added} new tools. final rows: {len(out)}. saved -> {CSV_PATH}")
-
-        # Print sample
-        print("\n[NEW SAMPLE]")
-        print(append_df.head(50).to_string(index=False))
-    else:
-        print("\n[UPDATE] added 0 new tools (no changes).")
-        if HEADLESS:
-            print("If you *expect* new tools today, try running once with HEADLESS=False to test for headless blocking.")
-        if DEBUG_DUMP_ON_EMPTY:
-            print(f"If warnings occurred, inspect HTML dumps in: {os.path.abspath(DEBUG_DIR)}")
+    df.to_csv(CSV_OUT, index=False)
+    log.info("Audit complete — final file saved")
 
 
 if __name__ == "__main__":
