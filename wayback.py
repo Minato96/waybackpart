@@ -237,8 +237,20 @@ def main():
         ):
             idx, result = future.result()
 
+            url = str(df_in.at[idx, "task_label_url"]).strip()
+            if not url:
+                continue
+
+
             row = {"task_label_url": df_in.at[idx, "task_label_url"]}
             row.update(result)
+
+            url = row["task_label_url"]
+
+            if url in done_urls:
+                continue   # already written by another thread
+
+            done_urls.add(url)
 
             df_out = pd.concat(
                 [df_out, pd.DataFrame([row])],
@@ -250,8 +262,15 @@ def main():
                 df_out.to_csv(CSV_OUT, index=False)
                 log.info(f"Checkpoint saved ({processed} rows)")
 
+        # Final safety net: ensure one row per task_label_url
+    df_out = df_out.drop_duplicates(
+        subset=["task_label_url"],
+        keep="first"
+    )
+
     df_out.to_csv(CSV_OUT, index=False)
     log.info("Audit complete — final Wayback file saved")
+
 
 
 
