@@ -97,8 +97,11 @@ def wayback_status_breakdown(url: str, session, *, match_type="exact"):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 r = sess.get(TIMEMAP_CDX, params=params, headers=headers, timeout=TIMEOUT)
-                if r.status_code in (429, 500, 502, 503, 504):
-                    raise RuntimeError(f"Transient HTTP {r.status_code}")
+                if r.status_code == 429:
+                    raise RuntimeError("RATE_LIMIT")
+                if r.status_code in (500, 502, 503, 504):
+                    raise RuntimeError(f"SERVER_ERROR_{r.status_code}")
+
                 r.raise_for_status()
 
                 if not r.text.strip():
@@ -132,11 +135,25 @@ def wayback_status_breakdown(url: str, session, *, match_type="exact"):
 
                 break
 
-            except Exception as e:
-                if attempt == MAX_RETRIES:
-                    log.warning(f"Wayback failed after retries: {url} ({variant})")
-                sleep_s = 0.7 * (0.7 + 0.6 * random.random())
-                time.sleep(min(sleep_s, 15))
+            except RuntimeError as e:
+                msg = str(e)
+
+                # 🔁 Infinite retry on rate limit
+                if msg == "RATE_LIMIT":
+                    sleep_s = random.uniform(20, 60)
+                    log.warning(f"429 rate limit — sleeping {sleep_s:.1f}s and retrying: {url}")
+                    time.sleep(sleep_s)
+                    continue
+
+                # 🔁 Limited retry on server errors
+                if attempt < MAX_RETRIES:
+                    sleep_s = (0.7 * (2 ** (attempt - 1))) * random.uniform(0.7, 1.3)
+                    time.sleep(min(sleep_s, 30))
+                    continue
+
+                log.warning(f"Wayback failed after retries: {url} ({variant})")
+                break
+
         if found_any:
             break   # 👈 STOP trying other URL variants
 
@@ -237,15 +254,21 @@ def main():
         ):
             idx, result = future.result()
 
-            url = str(df_in.at[idx, "task_label_url"]).strip()
-            if not url:
+            raw_url = df_in.at[idx, "task_label_url"]
+
+            if pd.isna(raw_url):
                 continue
+
+            url = str(raw_url).strip()
+            if not url or url.lower() == "nan":
+                continue
+
+            url = url.rstrip("/")
+
 
 
             row = {"task_label_url": df_in.at[idx, "task_label_url"]}
             row.update(result)
-
-            url = row["task_label_url"]
 
             if url in done_urls:
                 continue   # already written by another thread
