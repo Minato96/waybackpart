@@ -71,6 +71,8 @@ def wayback_status_breakdown(url: str, session, *, match_type="exact"):
     status_counter = Counter()
     ok_snapshots = []
     unknown = 0
+    found_any = False
+
 
     for variant in normalize_variants(url):
         params = {
@@ -112,6 +114,8 @@ def wayback_status_breakdown(url: str, session, *, match_type="exact"):
                         ok_snapshots.append(
                             f"https://web.archive.org/web/{ts}/{original}"
                         )
+                found_any = True
+
 
                 break
 
@@ -120,6 +124,9 @@ def wayback_status_breakdown(url: str, session, *, match_type="exact"):
                     log.warning(f"Wayback failed after retries: {url} ({variant})")
                 sleep_s = 0.7 * (0.7 + 0.6 * random.random())
                 time.sleep(min(sleep_s, 15))
+        if found_any:
+            break   # 👈 STOP trying other URL variants
+
 
     blue = sum(v for k, v in status_counter.items() if 200 <= k < 400)
     orange = sum(v for k, v in status_counter.items() if 400 <= k < 500)
