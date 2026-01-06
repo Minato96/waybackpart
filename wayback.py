@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import random
 import logging
 import pandas as pd
@@ -7,6 +8,7 @@ import requests
 from collections import Counter
 from urllib.parse import urlsplit, urlunsplit
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------- CONFIG ----------------
 TIMEMAP_CDX = "https://web.archive.org/web/timemap/cdx"
@@ -24,6 +26,17 @@ TIMEOUT = 30
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
+
+WAYBACK_OUT_COLS = [
+    "task_label_url",
+    "wayback_blue",
+    "wayback_orange",
+    "wayback_other",
+    "wayback_unknown",
+    "wayback_total_numeric_status",
+    "wayback_blue_urls",          # JSON string
+    "wayback_blue_urls_count",
+]
 
 
 MAX_BLUE_URLS_TO_STORE = None
@@ -145,72 +158,101 @@ def wayback_status_breakdown(url: str, session, *, match_type="exact"):
         "snapshots_ok": snapshots_ok,
     }
 
+def process_row(idx, url):
+    if not url or url.lower() in ("nan", "none"):
+        return idx, {
+            "wayback_blue": 0,
+            "wayback_orange": 0,
+            "wayback_other": 0,
+            "wayback_unknown": 0,
+            "wayback_total_numeric_status": 0,
+            "wayback_blue_urls": "",
+            "wayback_blue_urls_count": 0,
+        }
+
+    try:
+        res = wayback_status_breakdown(url, SESSION)
+        return idx, {
+            "wayback_blue": res["blue"],
+            "wayback_orange": res["orange"],
+            "wayback_other": res["other"],
+            "wayback_unknown": res["unknown_status"],
+            "wayback_total_numeric_status": res["total_numeric_status"],
+            "wayback_blue_urls": json.dumps(res["snapshots_ok"], ensure_ascii=False),
+            "wayback_blue_urls_count": len(res["snapshots_ok"]),
+        }
+    except Exception as e:
+        log.error(f"Row failed idx={idx} url={url} -> {e}")
+        return idx, {
+            "wayback_blue": 0,
+            "wayback_orange": 0,
+            "wayback_other": 0,
+            "wayback_unknown": 0,
+            "wayback_total_numeric_status": 0,
+            "wayback_blue_urls": "",
+            "wayback_blue_urls_count": 0,
+        }
+
 
 def main():
+    df_in = pd.read_csv(CSV_IN)
+    df_in.columns = [c.strip() for c in df_in.columns]
+
+    if "task_label_url" not in df_in.columns:
+        raise ValueError("Input CSV must contain 'task_label_url'")
+
+    # Load or create clean Wayback output
     if os.path.exists(CSV_OUT):
-        df = pd.read_csv(CSV_OUT)
-        log.info("Resuming from existing output file")
+        df_out = pd.read_csv(CSV_OUT)
+        log.info("Resuming from existing Wayback output file")
     else:
-        df = pd.read_csv(CSV_IN)
-        log.info("Loaded fresh input file")
+        df_out = pd.DataFrame(columns=WAYBACK_OUT_COLS)
+        log.info("Created new Wayback output file")
 
-    df.columns = [c.strip() for c in df.columns]
+    done_urls = set(df_out["task_label_url"]) if not df_out.empty else set()
 
-    required_col = "task_label_url"
-    if required_col not in df.columns:
-        raise ValueError(f"Missing column: {required_col}")
-
-    out_cols = [
-        "wayback_blue",
-        "wayback_orange",
-        "wayback_other",
-        "wayback_unknown",
-        "wayback_total_numeric_status",
-        "wayback_blue_urls",
-        "wayback_blue_urls_count",
+    # Build todo list from INPUT only
+    todo = [
+        (idx, str(url).strip())
+        for idx, url in df_in["task_label_url"].items()
+        if str(url).strip() and str(url).strip() not in done_urls
     ]
-    for c in out_cols:
-        if c not in df.columns:
-            df[c] = pd.NA
 
-    todo = df.index[df["wayback_blue"].isna()].tolist()
-    log.info(f"Total rows: {len(df)} | Remaining: {len(todo)}")
+    log.info(f"Total URLs: {len(df_in)} | Remaining: {len(todo)}")
 
     processed = 0
+    MAX_WORKERS = 6
 
-    for idx in tqdm(todo, desc="Wayback audit", unit="url"):
-        url = str(df.at[idx, required_col]).strip()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(process_row, idx, url)
+            for idx, url in todo
+        ]
 
-        if not url or url.lower() in ("nan", "none"):
-            df.loc[idx, out_cols] = [0, 0, 0, 0, 0, "", 0]
-            continue
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Wayback audit",
+            unit="url"
+        ):
+            idx, result = future.result()
 
-        try:
-            res = wayback_status_breakdown(url, SESSION)
+            row = {"task_label_url": df_in.at[idx, "task_label_url"]}
+            row.update(result)
 
-            df.at[idx, "wayback_blue"] = res["blue"]
-            df.at[idx, "wayback_orange"] = res["orange"]
-            df.at[idx, "wayback_other"] = res["other"]
-            df.at[idx, "wayback_unknown"] = res["unknown_status"]
-            df.at[idx, "wayback_total_numeric_status"] = res["total_numeric_status"]
+            df_out = pd.concat(
+                [df_out, pd.DataFrame([row])],
+                ignore_index=True
+            )
 
-            blue_urls = res["snapshots_ok"]
-            df.at[idx, "wayback_blue_urls"] = "\n".join(blue_urls)
-            df.at[idx, "wayback_blue_urls_count"] = len(blue_urls)
+            processed += 1
+            if processed % CHECKPOINT_EVERY == 0:
+                df_out.to_csv(CSV_OUT, index=False)
+                log.info(f"Checkpoint saved ({processed} rows)")
 
-        except Exception as e:
-            log.error(f"Row failed idx={idx} url={url} -> {e}")
-            df.loc[idx, out_cols] = [0, 0, 0, 0, 0, "", 0]
+    df_out.to_csv(CSV_OUT, index=False)
+    log.info("Audit complete — final Wayback file saved")
 
-        processed += 1
-        if processed % CHECKPOINT_EVERY == 0:
-            df.to_csv(CSV_OUT, index=False)
-            log.info(f"Checkpoint saved ({processed} rows)")
-
-        time.sleep(SLEEP_BETWEEN)
-
-    df.to_csv(CSV_OUT, index=False)
-    log.info("Audit complete — final file saved")
 
 
 if __name__ == "__main__":
