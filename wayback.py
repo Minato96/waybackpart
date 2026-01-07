@@ -28,6 +28,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from collections import defaultdict
 
 # ================= CONFIG =================
 
@@ -53,6 +54,8 @@ SAVE_EVERY = 50
 SNAPSHOT_DELAY = 0.3
 WAYBACK_RENDER_RETRIES = 4
 WAYBACK_RETRY_SLEEP = 6  # seconds
+CUTOFF_DATE = "20250526"  # YYYYMMDD (exclusive)
+
 
 # ================= RATE LIMITER =================
 
@@ -182,6 +185,33 @@ def fetch_wayback_rendered_html(driver, url, timeout=45):
             time.sleep(WAYBACK_RETRY_SLEEP)
 
     return None
+
+def pick_one_snapshot_per_day(cdx_rows):
+    by_day = defaultdict(list)
+
+    for r in cdx_rows:
+        day = r["timestamp"][:8]
+
+        # 🔴 HARD STOP: ignore snapshots on/after cutoff
+        if day >= CUTOFF_DATE:
+            continue
+
+        by_day[day].append(r)
+
+    chosen = []
+
+    for day in sorted(by_day.keys()):
+        snaps = by_day[day]
+
+        html = [
+            s for s in snaps
+            if s["mimetype"] and s["mimetype"].startswith("text/html")
+        ]
+
+        if html:
+            chosen.append(html[0])
+
+    return chosen
 
 # ================= STRICT METRIC EXTRACTORS =================
 # (NO GUESSING — ONLY REAL TAGS)
@@ -361,18 +391,27 @@ async def query_cdx(session, target_url):
     q = (
         f"{WAYBACK_CDX_URL}?url={target_url}"
         f"&from={WAYBACK_FROM}&to={WAYBACK_TO}"
-        f"&output=json&filter={WAYBACK_FILTER}&collapse=timestamp"
+        f"&output=json"
+        f"&filter=statuscode:200"
+        f"&filter=mimetype:text/html"
+        f"&fl=timestamp,statuscode,mimetype,original"
     )
+
+
     text, _ = await fetch(session, q, f"CDX {target_url}")
     data = json.loads(text)
-    return [
-        {
-            "timestamp": row[1],
-            "snapshot_url": f"https://web.archive.org/web/{row[1]}/{target_url}",
+    rows = []
+    for r in data[1:]:
+        rows.append({
+            "timestamp": r[0],
+            "statuscode": r[1],
+            "mimetype": r[2],
+            "original": r[3],
+            "snapshot_url": f"https://web.archive.org/web/{r[0]}/{target_url}",
             "source_url": target_url
-        }
-        for row in data[1:]
-    ]
+        })
+    return rows
+
 
 
 # ================= PARSER =================
@@ -447,8 +486,12 @@ async def main():
         cdx_bar = tqdm(TARGET_URLS, desc="CDX URLs")
         for url in cdx_bar:
             cdx_bar.set_postfix(url=url.split("/")[-2])
-            snaps = await query_cdx(session, url)
-            snapshots.extend(snaps)
+            raw_snaps = await query_cdx(session, url)
+            if not raw_snaps:
+                continue
+            daily_snaps = pick_one_snapshot_per_day(raw_snaps)
+            snapshots.extend(daily_snaps)
+
 
         # sort AFTER collecting all snapshots
         snapshots.sort(key=lambda x: (x["source_url"], x["timestamp"]))
@@ -463,7 +506,8 @@ async def main():
         driver = create_driver()
         for snap in snapshots:
             ts = snap["timestamp"]
-            key = f"{snap['source_url']}|{ts}"
+            day = ts[:8]
+            key = f"{snap['source_url']}|{day}"
 
             if key in done:
                 snap_bar.update(1)
