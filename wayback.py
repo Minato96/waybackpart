@@ -21,27 +21,23 @@ from typing import List, Dict, Optional
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ================= CONFIG =================
 
 TARGET_URLS = [
-    "https://theresanaiforthat.com/deals/",
-    "https://theresanaiforthat.com/trending/",
-    "https://theresanaiforthat.com/android/",
-    "https://theresanaiforthat.com/ios/",
-    "https://theresanaiforthat.com/telegram/",
-    "https://theresanaiforthat.com/mini-tools",
-    "https://theresanaiforthat.com/featured/",
-    "https://theresanaiforthat.com/popular/",
-    "https://theresanaiforthat.com/just-released/",
-    "https://theresanaiforthat.com/period/2024/",
-    "https://theresanaiforthat.com/period/2023/",
-    "https://theresanaiforthat.com/period/2025"
+    "https://theresanaiforthat.com"
 ]
 
 BASE_URL = "https://theresanaiforthat.com/"
 
-OUT_CSV = "ai_tools_deals_trending_plats_feaut_yrs.csv"
+OUT_CSV = "ai_tools_feautered.csv"
 CHECKPOINT_FILE = "wayback_checkpoint.json"
 
 WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
@@ -55,6 +51,8 @@ MAX_RETRIES = 10
 BACKOFF_BASE = 1.7
 SAVE_EVERY = 50
 SNAPSHOT_DELAY = 0.3
+WAYBACK_RENDER_RETRIES = 4
+WAYBACK_RETRY_SLEEP = 6  # seconds
 
 # ================= RATE LIMITER =================
 
@@ -122,6 +120,67 @@ def first_attr(li, selectors: List[str], attr: str) -> Optional[str]:
         el = li.select_one(sel)
         if el and el.get(attr):
             return el.get(attr)
+    return None
+
+# ================= SELENIUM RENDERER =================
+
+def create_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=chrome_options
+    )
+
+def fetch_wayback_rendered_html(driver, url, timeout=45):
+    for attempt in range(1, WAYBACK_RENDER_RETRIES + 1):
+        try:
+            driver.get(url)
+            wait = WebDriverWait(driver, timeout)
+
+            # 1️⃣ wait ONLY for page shell
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+            # 2️⃣ short, non-blocking check for ul.tasks
+            short_wait = WebDriverWait(driver, 8)
+            try:
+                short_wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "ul.tasks"))
+                )
+            except:
+                # ul.tasks genuinely not present → NOT an error
+                return driver.page_source
+
+            # 3️⃣ ul.tasks exists → now stabilize
+            prev = -1
+            stable_rounds = 0
+            for _ in range(20):
+                lis = driver.find_elements(By.CSS_SELECTOR, "ul.tasks > li.li")
+                count = len(lis)
+
+                if count == prev and count > 0:
+                    stable_rounds += 1
+                    if stable_rounds >= 2:
+                        break
+                else:
+                    stable_rounds = 0
+
+                prev = count
+                time.sleep(0.5)
+
+            return driver.page_source
+
+        except Exception as e:
+            tqdm.write(
+                f"[Wayback retry {attempt}/{WAYBACK_RENDER_RETRIES}] "
+                f"{url} → waiting {WAYBACK_RETRY_SLEEP}s"
+            )
+            time.sleep(WAYBACK_RETRY_SLEEP)
+
     return None
 
 # ================= STRICT METRIC EXTRACTORS =================
@@ -250,6 +309,11 @@ def extract_video(li):
         "views": safe_int(views.text) if views else None
     }
 
+def extract_featured_internal_link(li):
+    el = li.select_one("a.ai_link.new_tab[data-fid]")
+    if el and el.get("href"):
+        return urljoin(BASE_URL, el.get("href"))
+    return None
 
 def extract_comments_json(li):
     if "has_comment" not in li.get("class", []):
@@ -317,7 +381,11 @@ def parse_snapshot(html, ts, snap_url,source_url):
     soup = BeautifulSoup(html, "html.parser")
     rows = []
 
-    for li in soup.select("li.li"):
+    task_ul = soup.select_one("ul.tasks")
+    if not task_ul:
+        return []
+
+    for li in task_ul.select("> li.li"):
         r = {
             "snapshot_timestamp": ts,
             "snapshot_url": snap_url,
@@ -335,6 +403,7 @@ def parse_snapshot(html, ts, snap_url,source_url):
             "views": extract_views(li),
             "video": extract_video(li),
             "comments_json": extract_comments_json(li),
+            "featured_internal_link": extract_featured_internal_link(li),
             "is_verified": "verified" in li.get("class", []),
             "is_pinned": "is_pinned" in li.get("class", []),
             "share_slug": first_attr(li, [".share_ai"], "data-slug"),
@@ -390,7 +459,8 @@ async def main():
         row_bar = tqdm(desc="Rows")
 
         buffer = []
-
+        
+        driver = create_driver()
         for snap in snapshots:
             ts = snap["timestamp"]
             key = f"{snap['source_url']}|{ts}"
@@ -399,7 +469,7 @@ async def main():
                 snap_bar.update(1)
                 continue
 
-            html, _ = await fetch(session, snap["snapshot_url"], f"snapshot {ts}")
+            html = fetch_wayback_rendered_html(driver, snap["snapshot_url"])
             if html:
                 rows = parse_snapshot(
                         html,
@@ -425,6 +495,8 @@ async def main():
                 save_checkpoint(done)
 
             await asyncio.sleep(SNAPSHOT_DELAY)
+
+        driver.quit()
 
         if buffer:
             pd.DataFrame(buffer).to_csv(
