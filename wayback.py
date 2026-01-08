@@ -16,8 +16,8 @@ TIMEMAP_CDX = "https://web.archive.org/web/timemap/cdx"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
-CSV_IN  = "ai_tools_progress_04012026.csv"
-CSV_OUT = "task_audit_2.csv"
+CSV_IN  = "also_searched_generated_urls_task_audit.csv"
+CSV_OUT = "also_searched_generated_urls_task_audit_wayback.csv"
 
 SLEEP_BETWEEN = 0.03
 CHECKPOINT_EVERY = 50      # ✅ changed to 50
@@ -28,7 +28,7 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
 WAYBACK_OUT_COLS = [
-    "task_label_url",
+    "generated_search_links",
     "wayback_blue",
     "wayback_orange",
     "wayback_other",
@@ -215,8 +215,8 @@ def main():
     df_in = pd.read_csv(CSV_IN)
     df_in.columns = [c.strip() for c in df_in.columns]
 
-    if "task_label_url" not in df_in.columns:
-        raise ValueError("Input CSV must contain 'task_label_url'")
+    if "generated_search_links" not in df_in.columns:
+        raise ValueError("Input CSV must contain 'generated_search_links'")
 
     # Load or create clean Wayback output
     if os.path.exists(CSV_OUT):
@@ -226,12 +226,12 @@ def main():
         df_out = pd.DataFrame(columns=WAYBACK_OUT_COLS)
         log.info("Created new Wayback output file")
 
-    done_urls = set(df_out["task_label_url"]) if not df_out.empty else set()
+    done_urls = set(df_out["generated_search_links"]) if not df_out.empty else set()
 
     # Build todo list from INPUT only
     todo = [
         (idx, str(url).strip())
-        for idx, url in df_in["task_label_url"].items()
+        for idx, url in df_in["generated_search_links"].items()
         if str(url).strip() and str(url).strip() not in done_urls
     ]
 
@@ -254,7 +254,7 @@ def main():
         ):
             idx, result = future.result()
 
-            raw_url = df_in.at[idx, "task_label_url"]
+            raw_url = df_in.at[idx, "generated_search_links"]
 
             if pd.isna(raw_url):
                 continue
@@ -267,7 +267,7 @@ def main():
 
 
 
-            row = {"task_label_url": df_in.at[idx, "task_label_url"]}
+            row = {"generated_search_links": df_in.at[idx, "generated_search_links"]}
             row.update(result)
 
             df_out = pd.concat(
@@ -280,9 +280,9 @@ def main():
                 df_out.to_csv(CSV_OUT, index=False)
                 log.info(f"Checkpoint saved ({processed} rows)")
 
-        # Final safety net: ensure one row per task_label_url
+        # Final safety net: ensure one row per generated_search_links
     df_out = df_out.drop_duplicates(
-        subset=["task_label_url"],
+        subset=["generated_search_links"],
         keep="first"
     )
 
