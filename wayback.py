@@ -24,7 +24,7 @@ from tqdm import tqdm
 # ---------------- CONFIG ----------------
 INPUT_CSV = "taaft_tools_2015_2025.csv"
 URL_COLUMN = "tool_url"
-OUT_CSV = "ai_wayback_async_out_2024_2.csv"
+OUT_CSV = "ai_wayback_async_out_2024.csv"
 PROXIES_FILE = "proxies.txt"     # optional, one proxy per line: http://ip:port or socks5://ip:port
 USE_TOR = False                  # if True, your local tor must be running (socks5://127.0.0.1:9050)
 TOR_PROXY = "socks5://127.0.0.1:9050"
