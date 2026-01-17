@@ -17,7 +17,7 @@ import random
 import os
 from typing import Optional, List, Tuple
 from urllib.parse import urljoin
-
+from html import unescape
 # third-party progress bar
 from tqdm import tqdm
 
@@ -85,8 +85,6 @@ COLUMNS = [
     "featured_cards_json",
     "tools_count",
     "tools_json",
-    "cards_count",
-    "cards_json",
     "error"
 ]
 
@@ -320,7 +318,7 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
             record["use_case"] = None
 
         # pricing
-        pricing_divs = soup.find_all("span", class_="tag_price")
+        pricing_divs = soup.select("span.tag.price")
         pricing_texts = []
         for div in pricing_divs:
             t = div.find(string=True, recursive=False)
@@ -661,11 +659,10 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
 
                 # internal tool link
                 tool_a = li.find("a", class_="ai_link")
-                tool_link = urljoin(BASE_URL, tool_a.get("href")) if tool_a else None
+                tool_link = tool_a.get("href") if tool_a and tool_a.get("href") else None
 
                 # external website
-                ext_a = li.find("a", class_="external_ai_link")
-                external_link = urljoin(BASE_URL, ext_a.get("href")) if ext_a else None
+                external_link = unescape(li.get("data-url")) if li.get("data-url") else None
 
                 # task
                 task_a = li.find("a", class_="task_label")
@@ -689,6 +686,10 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
                 if rc_tag:
                     ratings_count = to_int_or_none(rc_tag.get_text(strip=True))
 
+                #comments_count
+                comments_tag = li.find("div", class_="comments")
+                comments = to_int_or_none(comments_tag.get_text(strip=True)) if comments_tag else None
+
                 # pricing
                 price_tag = li.find("a", class_="ai_launch_date")
                 pricing = price_tag.get_text(" ", strip=True) if price_tag else None
@@ -709,6 +710,7 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
                     "average_rating": rating,
                     "ratings_count": ratings_count,
                     "pricing": pricing,
+                    "comments_count": comments,
                     "screenshot": screenshot,
                     "featured": featured,
                     "task_id": task_id,
@@ -732,13 +734,12 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
             task_id = li.get("data-task_id")
             task_slug = li.get("data-task_slug")
 
-            # internal tool page
+            # internal tool link
             tool_a = li.find("a", class_="ai_link")
-            tool_link = urljoin(BASE_URL, tool_a.get("href")) if tool_a else None
+            tool_link = tool_a.get("href") if tool_a and tool_a.get("href") else None
 
             # external website
-            ext_a = li.find("a", class_="external_ai_link")
-            external_link = urljoin(BASE_URL, ext_a.get("href")) if ext_a else None
+            external_link = unescape(li.get("data-url")) if li.get("data-url") else None
 
             # task label
             task_a = li.find("a", class_="task_label")
@@ -752,6 +753,10 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
             # saves
             saves_tag = li.find("div", class_="saves")
             saves = to_int_or_none(saves_tag.get_text(strip=True)) if saves_tag else None
+
+            #comments_count
+            comments_tag = li.find("div", class_="comments")
+            comments = to_int_or_none(comments_tag.get_text(strip=True)) if comments_tag else None
 
             # pricing
             price_tag = li.find("a", class_="ai_launch_date")
@@ -770,6 +775,7 @@ def parse_page_to_record(html: str, original_url: str, snapshot_ts: str, snapsho
                 "task_link": task_link,
                 "description": description,
                 "saves": saves,
+                "comments_count": comments,
                 "pricing": pricing,
                 "icon": icon,
                 "task_id": task_id,
